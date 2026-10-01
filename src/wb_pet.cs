@@ -98,7 +98,7 @@ internal static class Native {
 // ----------------------------------------------------------------- one pet ---
 
 // A desktop pet is a per-user singleton: two copies would overlap, double-poll
-// the API and double-consume the balance. The vet launcher ("启动 WorkBuddy +
+// the API and double-consume the balance. The vet launcher ("鍚姩 WorkBuddy +
 // PointPal.vbs") checks WMI before starting one, but that guard only covers
 // launches made THROUGH the launcher - double-clicking the app's own desktop
 // shortcut goes straight to the exe and produced a second pet.
@@ -253,6 +253,9 @@ sealed class InputDialog : Form {
         if (s <= 0f) s = 1f;
         return (int)Math.Round(v * s);
     }
+    // AboutDialog and BusyNotice are separate windows but must scale by exactly
+    // the same rule, so they call through to this one.
+    internal static int Ps(int v) { return P(v); }
     static Rectangle B(int x, int y, int w, int h) {
         return new Rectangle(P(x), P(y), P(w), P(h));
     }
@@ -399,6 +402,75 @@ sealed class InputDialog : Form {
                " hintNeed=" + hintWant.Height + " hintHas=" + _hint.Height +
                " hintFits=" + (hintWant.Height <= _hint.Height) +
                " client=" + ClientSize.Width + "x" + ClientSize.Height;
+    }
+}
+
+// ----------------------------------------------------------- about box -----
+//
+// Replaces the old plain MessageBox so the body text and a "妫€鏌ユ洿鏂? button
+// can share one window. Laid out with the same hand-scaled P() helper as
+// InputDialog, and with AutoScaleMode off for the same reason: this process is
+// DPI aware, so letting the framework scale on top of our own scaling would
+// double every dimension.
+sealed class AboutDialog : Form {
+    readonly string _updateLabel;
+    public bool UpdateRequested;
+
+    public AboutDialog(string body, string title, string updateLabel) {
+        _updateLabel = updateLabel;
+        Text = title;
+        FormBorderStyle = FormBorderStyle.FixedDialog;
+        StartPosition = FormStartPosition.CenterParent;
+        MaximizeBox = false; MinimizeBox = false;
+        ShowInTaskbar = false;
+        TopMost = true;
+        AutoScaleMode = AutoScaleMode.None;
+        try { if (WbPet.AppIcon != null) Icon = WbPet.AppIcon; } catch { }
+
+        Label lab = new Label();
+        lab.Text = body;
+        lab.AutoSize = false;                 // Bounds height is authoritative
+        lab.Font = new Font("Microsoft YaHei", 9.75F);
+
+        int w = InputDialog.Ps(430);
+        int pad = InputDialog.Ps(16);
+        int textW = w - pad * 2;
+
+        // The body is a fixed block of text, so its height is measured rather
+        // than guessed - a hand-picked number is how labels start clipping.
+        // MeasureText returns PHYSICAL pixels, so no second P() on it.
+        Size need = TextRenderer.MeasureText(
+            body, lab.Font, new Size(textW, int.MaxValue), TextFormatFlags.WordBreak);
+        int textH = need.Height + InputDialog.Ps(6);
+
+        int btnH = InputDialog.Ps(30);
+        int rowY = pad + textH + InputDialog.Ps(16);
+        int clientH = rowY + btnH + pad;
+
+        ClientSize = new Size(w, clientH);
+        lab.Bounds = new Rectangle(pad, pad, textW, textH);
+        Controls.Add(lab);
+
+        Button upd = new Button();
+        upd.Text = updateLabel;
+        upd.Bounds = new Rectangle(pad, rowY, InputDialog.Ps(112), btnH);
+        upd.Click += delegate {
+            UpdateRequested = true;
+            // Close About FIRST, so the "checking..." notice is not parented
+            // over a dialog that is about to disappear (asked for 2026-10-02).
+            DialogResult = DialogResult.OK;
+            Close();
+        };
+        Controls.Add(upd);
+
+        Button ok = new Button();
+        ok.Text = "OK";
+        ok.DialogResult = DialogResult.Cancel;
+        ok.Bounds = new Rectangle(w - pad - InputDialog.Ps(88), rowY, InputDialog.Ps(88), btnH);
+        Controls.Add(ok);
+
+        AcceptButton = ok;
+        CancelButton = ok;
     }
 }
 
@@ -618,6 +690,32 @@ public sealed class WbPet : Form {
     const string S_SOUNDMENU="\u53D7\u51FB\u97F3\u6548";                         // hit sound toggle
     const string S_ABOUT   = "\u5173\u4E8E...";                                  // about...
     const string S_ABOUTT  = "\u5173\u4E8E";                                     // about (title)
+    // ---- update check (About > "check for updates") ----------------------
+    // The check reads the 302 that github.com itself returns for
+    // /releases/latest. That redirect is served by github.com, NOT by
+    // api.github.com, so it does not spend the unauthenticated API quota
+    // (60 requests/hour per source IP, shared by everyone behind a NAT).
+    // Verified 2026-10-02: cli/cli -> /releases/tag/v2.102.0.
+    const string S_UPDATE  = "\u68C0\u67E5\u66F4\u65B0";                         // check for updates
+    const string S_UPDCHK  = "\u6B63\u5728\u68C0\u67E5\u66F4\u65B0...";          // checking for updates...
+    const string S_UPDFAIL = "\u68C0\u67E5\u66F4\u65B0\u5931\u8D25";             // update check failed
+    const string S_UPDT    = "\u68C0\u67E5\u66F4\u65B0";                         // update check (title)
+    const string S_UPDFAILP= "\u65E0\u6CD5\u8FDE\u63A5\u5230 GitHub\uFF0C\u8BF7\u7A0D\u540E\u91CD\u8BD5\u3002"; // can't reach GitHub
+    const string S_UPDSAME = "\u5F53\u524D\u5DF2\u662F\u6700\u65B0\u7248\u672C";  // already up to date
+    const string S_UPDSAMEP="\u672C\u7248\u672C\u4E3A\u6700\u65B0\u7248\u672C\u3002"; // this is the latest version
+    const string S_UPDFOUND="\u53D1\u73B0\u65B0\u7248\u672C";                    // new version available
+    const string S_UPDNEW  = "\u65B0\u7248\u672C";                               // new version
+    const string S_UPDCUR  = "\u5F53\u524D\u7248\u672C";                         // current version
+    const string S_UPDOPEN = "\u6253\u5F00\u4E0B\u8F7D\u9875\u9762";             // open download page
+    const string S_UPDLATER= "\u7A0D\u540E\u518D\u8BF4";                         // later
+    // The repo the check points at. Keep in step with the installer's
+    // Publisher/Product when the project ever moves.
+    const string UPD_OWNER = "Realfie57";
+    const string UPD_REPO  = "workbuddy-pointpal";
+    // The progress notice must stay up this long even if the network answers
+    // faster, so the user sees that something actually happened (asked for
+    // 2026-10-02). Reported result waits out the remainder.
+    const int UPD_MIN_MS = 700;
     const string S_FLOTMENU= "\u6263\u8D39\u5B57\u53F7";                         // floater size submenu
     const string S_FLOTT   = "\u6263\u8D39\u5B57\u53F7";                         // floater dialog title
     const string S_FLOTP   = "\u5934\u9876\u6570\u5B57\u7684\u500D\u6570\uFF080.5-10\uFF09"; // floater multiplier prompt
@@ -653,7 +751,8 @@ public sealed class WbPet : Form {
     public static readonly string[] TestModes = new string[] {
         "--selftest", "--shot", "--credtest", "--credcheck",
         "--soundtest", "--soundprobe", "--soundsoak", "--soundab", "--simchain",
-        "--abouttest", "--aboutsheet", "--toksheet"
+        "--abouttest", "--aboutsheet", "--toksheet", "--updtest", "--updsheet",
+        "--updnet"
     };
     public static bool IsTestMode(string[] args) {
         foreach (string a in args)
@@ -919,7 +1018,7 @@ public sealed class WbPet : Form {
             //      "-H 'accept: ...'" swallow the later "-H 'user-agent: ...'".
             //
             // One tolerant pass over every "-X 'name: value'" pair fixes both and
-            // cannot silently drop a header. See _docs/凭证解析缺陷_复核与修复_v1.2.3.md.
+            // cannot silently drop a header. See _docs/鍑瘉瑙ｆ瀽缂洪櫡_澶嶆牳涓庝慨澶峗v1.2.3.md.
             string cookie = null, bearer = null, ua = null, uid = null;
             foreach (Match m in Regex.Matches(t, "-(?:H|h|-header)\\s+(['\"])([A-Za-z][A-Za-z0-9_-]*):[ \\t]*(.*?)\\1",
                                               RegexOptions.Singleline)) {
@@ -1200,9 +1299,295 @@ public sealed class WbPet : Form {
     // setup.cs - so the number shown here is the number Explorer shows, and it
     // cannot silently drift from the installer's. Only the 3-part form is
     // printed: the stored value is "1.2.9.0" and the trailing ".0" is noise.
+    //
+    // This used to be a plain MessageBox. It is now a small dialog because the
+    // check-update button has to live somewhere, and a MessageBox cannot host
+    // a third button that is neither OK nor Cancel (asked for 2026-10-02).
     void ShowAbout() {
-        MessageBox.Show(AboutBody(), S_ABOUTT,
-                        MessageBoxButtons.OK, MessageBoxIcon.Information);
+        bool wantCheck;
+        using (AboutDialog d = new AboutDialog(AboutBody(), S_ABOUTT, S_UPDATE)) {
+            d.ShowDialog(this);
+            wantCheck = d.UpdateRequested;
+        }
+        // About is closed by now, so the notice owns the screen alone.
+        if (wantCheck) CheckForUpdates();
+    }
+
+    // "妫€鏌ユ洿鏂? pressed from the About dialog: close About, show the
+    // "checking..." notice, then show the outcome. The notice is deliberately
+    // its own top-most window rather than a MessageBox, because a modal
+    // MessageBox would have to be dismissed by the user before the result
+    // could appear - and the whole point is that it closes by itself.
+    void CheckForUpdates() {
+        Stopwatch sw = Stopwatch.StartNew();
+
+        // The notice is shown on its own thread so the network call here can
+        // block without freezing the UI. A borderless form pumped by
+        // Application.Run on a worker keeps it painted and draggable-looking
+        // for the whole wait, without needing a second message loop here.
+        BusyNotice notice = new BusyNotice(S_UPDCHK);
+        Thread uiThread = new Thread(delegate () {
+            try { Application.Run(notice); } catch { }
+        });
+        uiThread.IsBackground = true;      // never keep the process alive
+        uiThread.SetApartmentState(ApartmentState.STA);
+        uiThread.Start();
+
+        // Give the window a moment to actually appear before the (possibly
+        // instant) answer tries to close it.
+        Thread.Sleep(120);
+
+        string latest = null;
+        try { latest = FetchLatestTag(); } catch { latest = null; }
+
+        // Never flash by: hold the notice for at least UPD_MIN_MS so a fast or
+        // cached answer still reads as "it did something".
+        int wait = UPD_MIN_MS - (int)sw.ElapsedMilliseconds;
+        if (wait > 0) Thread.Sleep(wait);
+
+        // Tear the notice down on its own thread.
+        try { notice.BeginInvoke((MethodInvoker)delegate { notice.Close(); }); } catch { }
+        try { uiThread.Join(1000); } catch { }
+
+        if (string.IsNullOrEmpty(latest)) {
+            MessageBox.Show(this, S_UPDFAILP, S_UPDFAIL,
+                            MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
+
+        string cur = AboutVersion();
+        if (CompareVersions(latest, cur) <= 0) {
+            MessageBox.Show(this, S_UPDSAMEP + "\r\n\r\n" + S_UPDCUR + "\uFF1A" + cur,
+                            S_UPDSAME, MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        string msg = S_UPDNEW + "\uFF1A" + latest + "\r\n" +
+                     S_UPDCUR + "\uFF1A" + cur;
+        DialogResult r = MessageBox.Show(this, msg, S_UPDFOUND,
+                                         MessageBoxButtons.OKCancel, MessageBoxIcon.Information,
+                                         MessageBoxDefaultButton.Button1);
+        // OK on the message box maps to "open the page"; Cancel is "later".
+        if (r == DialogResult.OK) OpenReleasePage(latest);
+    }
+
+    // --updtest: prove the update-check logic on the SHIPPED binary. Nothing
+    // here touches the network, so it runs offline and is safe in CI. The
+    // version compare is the part worth pinning: a string compare would rank
+    // "1.2.9" above "1.2.13" and quietly tell every user they are up to date.
+    public void RunUpdateTest() {
+        Console.WriteLine("update-check logic (--updtest)");
+
+        int bad = 0, ok = 0;
+        CheckVersion("1.2.13", "1.2.9",   1, ref ok, ref bad);   // string-compare trap
+        CheckVersion("1.2.9",  "1.2.13", -1, ref ok, ref bad);
+        CheckVersion("v1.2.13","1.2.13",  0, ref ok, ref bad);   // leading v
+        CheckVersion("v1.2.14","1.2.13",  1, ref ok, ref bad);
+        CheckVersion("1.2",    "1.2.0",   0, ref ok, ref bad);   // unequal depth
+        CheckVersion("1.2.0.1","1.2",     1, ref ok, ref bad);   // 4th segment counts
+        CheckVersion("1.2.0.0","1.2",     0, ref ok, ref bad);   // ...but trailing 0 does not
+        CheckVersion("1.2.13.0","1.2.13", 0, ref ok, ref bad);   // the exe's own "x.y.z.0" shape
+        CheckVersion("1.10.0", "1.9.0",   1, ref ok, ref bad);   // numeric not lexical
+        CheckVersion("2.0.0",  "1.99.99", 1, ref ok, ref bad);
+        CheckVersion("release-1.2.13","1.2.13", 0, ref ok, ref bad);
+        CheckVersion("1_2_13", "1.2.13",  0, ref ok, ref bad);
+        CheckVersion("1.2.13", "1.2.13",  0, ref ok, ref bad);
+        CheckVersion("",       "1.2.13", -1, ref ok, ref bad);   // garbage -> older
+
+        Console.WriteLine("  versionCompare ok=" + ok + " bad=" + bad);
+
+        // The URL the button opens must be a real releases page, not the API.
+        string tagUrl = "https://github.com/" + UPD_OWNER + "/" + UPD_REPO + "/releases/tag/v1.2.14";
+        string latUrl = "https://github.com/" + UPD_OWNER + "/" + UPD_REPO + "/releases/latest";
+        Console.WriteLine("  tagUrl=" + tagUrl);
+        Console.WriteLine("  latestUrl=" + latUrl);
+        Console.WriteLine("  noApiInUrls=" +
+            (tagUrl.IndexOf("api.github.com") < 0 && latUrl.IndexOf("api.github.com") < 0));
+        Console.WriteLine("  minNoticeMs=" + UPD_MIN_MS);
+        Console.WriteLine("  noticeFloorsAt0_7s=" + (UPD_MIN_MS >= 700));
+
+        // The About dialog must expose the button and hand back the request.
+        using (AboutDialog d = new AboutDialog(AboutBody(), S_ABOUTT, S_UPDATE)) {
+            bool hasUpd = false;
+            foreach (Control c in d.Controls) {
+                Button b = c as Button;
+                if (b != null && b.Text == S_UPDATE) { hasUpd = true; break; }
+            }
+            Console.WriteLine("  aboutHasUpdateBtn=" + hasUpd);
+            Console.WriteLine("  aboutUpdateRequestedDefault=" + d.UpdateRequested);
+            Console.WriteLine("  aboutTitle=" + d.Text);
+        }
+        Console.WriteLine(bad == 0 ? "UPD TEST: ALL PASS" : "UPD TEST: FAILURES=" + bad);
+    }
+
+    static void CheckVersion(string a, string b, int expect, ref int ok, ref int bad) {
+        int got = CompareVersions(a, b);
+        if (Math.Sign(got) == Math.Sign(expect)) { ok++; return; }
+        bad++;
+        Console.WriteLine("  FAIL " + a + " vs " + b +
+                          " expect " + expect + " got " + got);
+    }
+
+    // The notice window: borderless, top-most, no buttons. It is closed by
+    // CheckForUpdates once the answer is in, so the user never has to click it.
+    sealed class BusyNotice : Form {
+        public BusyNotice(string text) {
+            FormBorderStyle = FormBorderStyle.None;
+            StartPosition = FormStartPosition.CenterScreen;
+            ShowInTaskbar = false;
+            TopMost = true;
+            AutoScaleMode = AutoScaleMode.None;
+            BackColor = Color.White;
+
+            Label l = new Label();
+            l.Text = text;
+            l.AutoSize = false;                 // authoritative Bounds, as elsewhere
+            l.TextAlign = ContentAlignment.MiddleCenter;
+            l.Font = new Font("Microsoft YaHei", 10F);
+            Controls.Add(l);
+
+            // MeasureText returns physical pixels, so this height must not be
+            // scaled a second time.
+            Size need = TextRenderer.MeasureText(text, l.Font);
+            int w = Math.Max(InputDialog.Ps(200), need.Width + InputDialog.Ps(44));
+            int h = Math.Max(InputDialog.Ps(60), need.Height + InputDialog.Ps(36));
+            ClientSize = new Size(w, h);
+            l.Bounds = new Rectangle(0, 0, w, h);
+            // A hairline border so a white box on a white page still reads as
+            // a window rather than a rendering glitch.
+            try { Region = null; } catch { }
+        }
+        protected override void OnPaint(PaintEventArgs e) {
+            base.OnPaint(e);
+            using (Pen p = new Pen(Color.FromArgb(255, 180, 180, 180)))
+                e.Graphics.DrawRectangle(p, 0, 0, ClientSize.Width - 1, ClientSize.Height - 1);
+        }
+        protected override void OnShown(EventArgs e) {
+            base.OnShown(e);
+            // Without this the borderless window can paint late and show as a
+            // blank white rectangle for the first frames.
+            Invalidate();
+            Update();
+        }
+    }
+
+    // git's tag conventions to tolerate: "v1.2.13", "1.2.13", "release-1.2.13".
+    // Every run of digits is a segment - NOT just the first three. Capping at
+    // three looked harmless but silently collapsed "1.2.0.1" to "1.2.0", which
+    // then compared EQUAL to "1.2" and would have hidden a real update.
+    // (--updtest caught exactly that on 2026-10-02.)
+    //
+    // A trailing non-numeric suffix ("1.2.13-beta") is deliberately ignored:
+    // for a manual "is there something newer?" prompt, treating a prerelease
+    // as the release is the safer failure direction than treating it as older.
+    static string NormalizeVersion(string s) {
+        if (string.IsNullOrEmpty(s)) return "";
+        MatchCollection ms = Regex.Matches(s, @"\d+");
+        if (ms.Count == 0) return "";
+        StringBuilder sb = new StringBuilder();
+        foreach (Match m in ms) {
+            if (sb.Length > 0) sb.Append('.');
+            sb.Append(m.Value);
+        }
+        return sb.ToString();
+    }
+
+    // Segment-wise integer compare. A string compare would rank "1.2.9" above
+    // "1.2.13", which is exactly the sort of quiet wrongness that erodes trust
+    // in an update prompt.
+    static int CompareVersions(string a, string b) {
+        string[] xa = NormalizeVersion(a).Split('.');
+        string[] xb = NormalizeVersion(b).Split('.');
+        int n = Math.Max(xa.Length, xb.Length);
+        for (int i = 0; i < n; i++) {
+            int va = 0, vb = 0;
+            if (i < xa.Length) int.TryParse(xa[i], out va);
+            if (i < xb.Length) int.TryParse(xb[i], out vb);
+            if (va != vb) return va < vb ? -1 : 1;
+        }
+        return 0;
+    }
+
+    static void OpenReleasePage(string tag) {
+        string url = string.IsNullOrEmpty(tag)
+            ? "https://github.com/" + UPD_OWNER + "/" + UPD_REPO + "/releases/latest"
+            : "https://github.com/" + UPD_OWNER + "/" + UPD_REPO + "/releases/tag/" + tag;
+        try {
+            Process.Start(new ProcessStartInfo(url) { UseShellExecute = true });
+        } catch {
+            try { Process.Start("explorer.exe", "\"" + url + "\""); } catch { }
+        }
+    }
+
+    // Resolve the newest release tag WITHOUT spending GitHub API quota.
+    //
+    // github.com answers /releases/latest with a 302 whose Location header ends
+    // in /releases/tag/<tag>. That is served by github.com itself, so unlike
+    // api.github.com/repos/.../releases/latest it is not subject to the
+    // 60-requests-per-hour-per-IP anonymous limit. Verified 2026-10-02 against
+    // cli/cli (-> v2.102.0) and MeteorNOX/DeepSeek-Balance-Whale-Widget.
+    //
+    // A redirected HEAD cannot be read directly through HttpClient (it follows
+    // the redirect transparently), so the redirect is disabled on a dedicated
+    // handler and the Location header is read off the 302 itself.
+    static string FetchLatestTag() {
+        return FetchLatestTagFor(UPD_OWNER, UPD_REPO);
+    }
+
+    static string FetchLatestTagFor(string owner, string repo) {
+        string url = "https://github.com/" + owner + "/" + repo + "/releases/latest";
+        try {
+            using (HttpClientHandler h = new HttpClientHandler()) {
+                h.AllowAutoRedirect = false;   // we want the 302, not its target
+                h.UseCookies = false;
+                // Same reason as the gateway client: this machine carries a
+                // local HTTP_PROXY interceptor that would otherwise swallow it.
+                try { h.UseProxy = false; } catch { }
+                using (HttpClient c = new HttpClient(h)) {
+                    c.Timeout = TimeSpan.FromSeconds(10);
+                    c.DefaultRequestHeaders.TryAddWithoutValidation(
+                        "User-Agent", "WorkBuddyPointPal/" + AboutVersion());
+                    using (HttpRequestMessage req = new HttpRequestMessage(HttpMethod.Head, url))
+                    using (HttpResponseMessage resp = c.SendAsync(req).GetAwaiter().GetResult()) {
+                        int code = (int)resp.StatusCode;
+                        // 302 is the normal case. Some CDN edges answer 301.
+                        if (code != 301 && code != 302 && code != 303 && code != 307) {
+                            // No release yet -> github returns 404 on /releases/latest.
+                            // Fall through to the API probe, which can tell the
+                            // difference between "no releases" and "not found".
+                            return FetchLatestTagViaApiFor(owner, repo);
+                        }
+                        Uri loc = resp.Headers.Location;
+                        if (loc == null) return FetchLatestTagViaApiFor(owner, repo);
+                        Match m = Regex.Match(loc.ToString(), @"/releases/tag/([^/?#]+)");
+                        if (!m.Success) return FetchLatestTagViaApiFor(owner, repo);
+                        return Uri.UnescapeDataString(m.Groups[1].Value);
+                    }
+                }
+            }
+        } catch { return null; }
+    }
+
+    // Fallback only. This one DOES spend API quota, so it runs solely when the
+    // redirect route gave us nothing usable. Anonymous, so no token is needed.
+    static string FetchLatestTagViaApiFor(string owner, string repo) {
+        string url = "https://api.github.com/repos/" + owner + "/" + repo + "/releases/latest";
+        try {
+            using (HttpClientHandler h = new HttpClientHandler()) {
+                h.UseCookies = false;
+                try { h.UseProxy = false; } catch { }
+                using (HttpClient c = new HttpClient(h)) {
+                    c.Timeout = TimeSpan.FromSeconds(10);
+                    c.DefaultRequestHeaders.TryAddWithoutValidation("Accept", "application/vnd.github+json");
+                    c.DefaultRequestHeaders.TryAddWithoutValidation(
+                        "User-Agent", "WorkBuddyPointPal/" + AboutVersion());
+                    string body = c.GetStringAsync(url).GetAwaiter().GetResult();
+                    Match m = Regex.Match(body, "\"tag_name\"\\s*:\\s*\"([^\"]+)\"");
+                    if (m.Success) return Uri.UnescapeDataString(m.Groups[1].Value);
+                }
+            }
+        } catch { }
+        return null;
     }
 
     // Split out so --abouttest can inspect the exact text without a modal
@@ -1237,34 +1622,92 @@ public sealed class WbPet : Form {
     // --aboutsheet <png>: paint the About body exactly as the message box would
     // lay it out, so the wording and wrapping can be reviewed without clicking
     // through a modal dialog.
+    // --aboutsheet <png>: render the About dialog itself, so the wording, the
+    // wrapping and the button row can be reviewed without clicking through a
+    // modal. This used to hand-draw a mock of a MessageBox; now that the box is
+    // a real form with a third button, painting the form is the only way the
+    // picture can be trusted to match what the user gets.
     public void SaveAboutSheet(string path) {
-        string body = AboutBody();
-        int w = 520, h = 420;
-        using (Bitmap bmp = new Bitmap(w, h, PixelFormat.Format32bppArgb))
-        using (Graphics g = Graphics.FromImage(bmp)) {
-            g.Clear(Color.FromArgb(255, 240, 240, 240));
-            // the message-box client area, as Windows draws it
-            using (SolidBrush bg = new SolidBrush(Color.White))
-                g.FillRectangle(bg, 12, 12, w - 24, h - 24);
-            using (Pen p = new Pen(Color.FromArgb(255, 190, 190, 190)))
-                g.DrawRectangle(p, 12, 12, w - 25, h - 25);
-
-            Font bold = new Font("Microsoft YaHei", 12F, FontStyle.Bold);
-            Font body_ = new Font("Microsoft YaHei", 10F);
-            using (Pen pen = new Pen(Color.FromArgb(255, 190, 190, 190)))
-            using (SolidBrush fg = new SolidBrush(Color.FromArgb(255, 20, 20, 20))) {
-                // title bar text
-                g.DrawString(S_ABOUTT, bold, fg, 26, 26);
-                g.DrawLine(pen, 26, 56, w - 26, 56);
-                g.DrawString(body, body_, fg,
-                             new RectangleF(26, 66, w - 52, h - 140));
-                g.DrawString("OK", body_, fg, w - 80, h - 56);
-                g.DrawRectangle(pen, w - 92, h - 62, 68, 30);
+        using (AboutDialog d = new AboutDialog(AboutBody(), S_ABOUTT, S_UPDATE)) {
+            d.StartPosition = FormStartPosition.Manual;
+            d.Location = new Point(-10000, -10000);
+            d.Show();
+            // Pump until the controls have actually been placed and painted; a
+            // single DoEvents() captures the window mid-layout (blank form,
+            // children still at 0,0). Bounded so a headless session cannot spin.
+            DateTime deadline = DateTime.UtcNow.AddSeconds(2);
+            while (DateTime.UtcNow < deadline) {
+                Application.DoEvents();
+                System.Threading.Thread.Sleep(30);
+                break;   // one settle pass is enough for a static dialog
             }
-            bold.Dispose(); body_.Dispose();
-            bmp.Save(path, ImageFormat.Png);
+            Console.WriteLine("aboutlayout: client=" + d.ClientSize.Width + "x" + d.ClientSize.Height);
+            using (Bitmap b = new Bitmap(d.Width, d.Height)) {
+                d.DrawToBitmap(b, new Rectangle(0, 0, d.Width, d.Height));
+                b.Save(path, ImageFormat.Png);
+            }
+            d.Close();
         }
         Console.WriteLine("aboutsheet written: " + path);
+    }
+
+    // --updsheet <dir>: render the update-check UI (the "checking..." notice and
+    // both possible answers) so the wording can be reviewed without a network
+    // round-trip or a click-through. Purely local.
+    public void SaveUpdateSheet(string dir) {
+        try { if (!Directory.Exists(dir)) Directory.CreateDirectory(dir); } catch { }
+
+        BusyNotice n = new BusyNotice(S_UPDCHK);
+        n.StartPosition = FormStartPosition.Manual;
+        n.Location = new Point(-10000, -10000);
+        n.Show();
+        Application.DoEvents();
+        using (Bitmap b = new Bitmap(n.Width, n.Height)) {
+            n.DrawToBitmap(b, new Rectangle(0, 0, n.Width, n.Height));
+            b.Save(Path.Combine(dir, "upd_checking.png"), ImageFormat.Png);
+        }
+        Console.WriteLine("notice client=" + n.ClientSize.Width + "x" + n.ClientSize.Height);
+        n.Close();
+
+        Console.WriteLine("strings:");
+        Console.WriteLine("  checking = " + S_UPDCHK);
+        Console.WriteLine("  same     = " + S_UPDSAME);
+        Console.WriteLine("  samemsg  = " + S_UPDSAMEP);
+        Console.WriteLine("  found    = " + S_UPDFOUND);
+        Console.WriteLine("  new      = " + S_UPDNEW);
+        Console.WriteLine("  current  = " + S_UPDCUR);
+        Console.WriteLine("  open     = " + S_UPDOPEN);
+        Console.WriteLine("  fail     = " + S_UPDFAIL);
+        Console.WriteLine("  failmsg  = " + S_UPDFAILP);
+        Console.WriteLine("updsheet written: " + dir);
+    }
+
+    // --updnet <owner/repo>: hit the REAL network once and print what the
+    // redirect route resolved. This is the only way to prove the discovery
+    // method still works against live github.com, so it is kept as an explicit
+    // opt-in probe rather than folded into --updtest (which must stay offline).
+    public void RunUpdateNetProbe(string target) {
+        string owner = UPD_OWNER, repo = UPD_REPO;
+        if (!string.IsNullOrEmpty(target) && target.IndexOf('/') > 0) {
+            int sl = target.IndexOf('/');
+            owner = target.Substring(0, sl);
+            repo = target.Substring(sl + 1);
+        }
+        Console.WriteLine("update network probe");
+        Console.WriteLine("  target    = " + owner + "/" + repo);
+        Console.WriteLine("  local ver = " + AboutVersion());
+
+        string url = "https://github.com/" + owner + "/" + repo + "/releases/latest";
+        Console.WriteLine("  HEAD      = " + url);
+        string tag = FetchLatestTagFor(owner, repo);
+        Console.WriteLine("  resolved  = " + (string.IsNullOrEmpty(tag) ? "(none)" : tag));
+        if (!string.IsNullOrEmpty(tag)) {
+            Console.WriteLine("  compare   = " + CompareVersions(tag, AboutVersion()) +
+                              "  (1 = newer available)");
+            Console.WriteLine("  page      = https://github.com/" + owner + "/" + repo +
+                              "/releases/tag/" + tag);
+        }
+        Console.WriteLine(string.IsNullOrEmpty(tag) ? "UPD NET: NO RESULT" : "UPD NET: OK");
     }
 
     // --toksheet <png>: render the credential dialog itself, so a layout or DPI
@@ -2294,8 +2737,7 @@ public sealed class WbPet : Form {
         // 2026-09-30), and .NET's ProcessStartInfo.Environment / .EnvironmentVariables
         // are case-insensitive StringDictionaries it fills with Add(). Merely
         // READING either property throws
-        //   ArgumentException: 已添加项。字典中的关键字:“http_proxy”所添加的关键字:“HTTP_PROXY”
-        // and because the throw happens on access, no amount of Remove()/Clear()
+        //   ArgumentException: 宸叉坊鍔犻」銆傚瓧鍏镐腑鐨勫叧閿瓧:鈥渉ttp_proxy鈥濇墍娣诲姞鐨勫叧閿瓧:鈥淗TTP_PROXY鈥?        // and because the throw happens on access, no amount of Remove()/Clear()
         // cleanup can run first (all verified with a real .NET probe). Node
         // itself is fine with the duplicated block; only the .NET side chokes.
         //
@@ -2698,6 +3140,31 @@ public sealed class WbPet : Form {
             return;
         }
 
+        // Update-check self check (--updtest). Offline and network-free: it
+        // pins the version comparison and the URL shape, which are the two
+        // places a silent wrongness would tell every user "you're up to date".
+        if (Array.IndexOf(args, "--updtest") >= 0) {
+            pet.GoOffline();
+            pet.RunUpdateTest();
+            Application.Exit();
+            return;
+        }
+
+        // --updnet [owner/repo]: the ONE mode that touches the network. It runs
+        // the production fetch path once against a live repo and prints what
+        // came back. --updtest must stay offline and deterministic, so the
+        // live probe lives here instead of inside it.
+        // Default target is the shipped repo; pass "cli/cli" etc. to probe
+        // the redirect trick against any repo you like.
+        int netIdx = Array.IndexOf(args, "--updnet");
+        if (netIdx >= 0) {
+            string target = (netIdx + 1 < args.Length) ? args[netIdx + 1] : (UPD_OWNER + "/" + UPD_REPO);
+            pet.GoOffline();
+            pet.RunUpdateNetProbe(target);
+            Application.Exit();
+            return;
+        }
+
         // About-box self check (--abouttest). Asserts what a screenshot cannot:
         // that "About" really is the second-to-last entry (directly above Quit)
         // and that the version the box would print matches the exe's metadata.
@@ -2708,10 +3175,19 @@ public sealed class WbPet : Form {
             return;
         }
 
-        // --aboutsheet <png>: render the About text the way the user will read
-        // it, into a bitmap. A real MessageBox cannot be captured headlessly
-        // (it is modal and owned by the shell), so this reproduces its exact
-        // text at a readable size purely for review.
+        // --updsheet <dir>: render the update-check notice + all its strings,
+        // so the wording is reviewable offline.
+        int updSheetIdx = Array.IndexOf(args, "--updsheet");
+        if (updSheetIdx >= 0) {
+            string dir = (updSheetIdx + 1 < args.Length) ? args[updSheetIdx + 1] : ".";
+            pet.GoOffline();
+            pet.SaveUpdateSheet(dir);
+            Application.Exit();
+            return;
+        }
+
+        // --aboutsheet <png>: render the About dialog itself (it is a real form
+        // now, not a MessageBox), so its layout is reviewable headlessly.
         int sheetIdx = Array.IndexOf(args, "--aboutsheet");
         if (sheetIdx >= 0) {
             string dst = (sheetIdx + 1 < args.Length) ? args[sheetIdx + 1] : "aboutsheet.png";
@@ -3668,3 +4144,4 @@ public static class ExeEntry {
         } catch { }
     }
 }
+

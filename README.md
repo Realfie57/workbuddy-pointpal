@@ -62,6 +62,20 @@ Windows 10 / 11 · 免安装 · 无需 Node / .NET SDK · 不联网也能跑（�
 
 ---
 
+## 检查更新
+
+右键 →「**关于…**」→ 左下角「**检查更新**」：关于框关闭，弹出「正在检查更新…」，
+查到后**至少停留 0.7 秒**再给结果——已是最新就显示当前版本号，有新版本就并列显示新旧两个号，
+并给一个「**打开下载页面**」按钮跳到 GitHub。
+
+> **只提示，不自动更新。** 程序不会偷偷下载或替换文件。不点「检查更新」就完全没有网络请求。
+>
+> 实现在读 `github.com` 对 `/releases/latest` 的 **302 跳转**（而不是调 `api.github.com`），
+> 因此**不消耗 GitHub API 限额**；版本号按**逐段整数**比较，`1.2.9` 不会被误判成比 `1.2.13` 新。
+> 想验证这条路径在你网络下通不通：`.\WorkBuddy PointPal.exe --updnet cli/cli`
+
+---
+
 ## 可选配置
 
 全部通过环境变量（不设就用默认值）：
@@ -158,6 +172,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File _build_setup_inline.ps1
 .\WorkBuddy PointPal.exe --credtest        # 凭证解析器（内置"用户 token.txt 未被改动"守卫）
 .\WorkBuddy PointPal.exe --abouttest       # 菜单序位 + 版本
 .\WorkBuddy PointPal.exe --toksheet x.png  # 把凭证弹窗渲染成图，并打印布局自检
+.\WorkBuddy PointPal.exe --updtest         # 检查更新：14 组版本号比较 + URL 形状 + 0.7s 下限（离线）
+.\WorkBuddy PointPal.exe --updnet cli/cli  # 检查更新：唯一联网模式，验证 302 跳转路径可用
 ```
 
 `Setup.exe /CHECKONLY` 只检查本机是否已安装，不做任何改动（退出码 0 = 已安装 / 1 = 未安装）。
@@ -169,7 +185,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File _build_setup_inline.ps1
 
 本项目是 **[DSH 余额桌宠](https://github.com/VKmich16/VK-1)**（Windows 原版，作者 **VKmich16**）
 的改编版：**美术形象、动画、音效、账本架构完全沿用原作**，数据源从 DeepSeek 余额换成 WorkBuddy 积分接口，
-并做了大量工程化改造（单文件 exe 打包、向导式安装包、凭证弹窗、高 DPI 适配、离线自检、双启动器）。
+并做了大量工程化改造（单文件 exe 打包、向导式安装包、凭证弹窗、高 DPI 适配、离线自检、
+检查更新、双启动器）。
 
 桌面挂件这一整套「手持平板 + 扣费红闪 + `-N` 飘字 + Q 弹音效」的形态，源头是
 **[MeteorNOX/DeepSeek-Balance-Whale-Widget](https://github.com/MeteorNOX/DeepSeek-Balance-Whale-Widget)**
