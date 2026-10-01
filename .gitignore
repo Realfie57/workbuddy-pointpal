@@ -1,0 +1,38 @@
+# ---- 用户数据：绝不入库 ----
+token.txt
+state.ini
+pet.log
+error.log
+
+# ---- 构建产物 ----
+*.exe
+*.zip
+_build_log.txt
+_build_*_log.txt
+
+# ---- 开发辅助 / 截图 / 自检输出 ----
+_tools/
+_docs/
+_deliver/
+_wizard_shots/
+_backup_v*/
+_unzip/
+_gh_repo/
+_.superceded
+*.superseded
+_*.png
+_*.txt
+selftest.png
+shot.png
+
+# ---- 参考用上游原始包，不入库 ----
+DSH余额桌宠.zip
+DSH-DaFeiYu-macOS.zip
+request-curl.txt
+
+# ---- 系统垃圾 ----
+Thumbs.db
+desktop.ini
+.DS_Store
+*.tmp
+~$*

@@ -1,0 +1,70 @@
+MIT License
+
+Copyright (c) 2026 Realfie57 (Ruofei Zhou)
+
+================================================================================
+ENGLISH
+================================================================================
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+================================================================================
+中文
+================================================================================
+
+本项目的**源代码**（`src/`、`build/`、`*.vbs`、`*.cmd` 及文档）以上述 MIT 条款授权。
+
+--------------------------------------------------------------------------------
+例外：上游素材与上游架构不在 MIT 授权范围内
+--------------------------------------------------------------------------------
+
+WorkBuddy PointPal 是 DSH 余额桌宠的改编版。以下内容**源自上游项目，不是本项目的
+原创作品，因此不受本项目 MIT 授权覆盖**：
+
+  上游项目   ：DSH 余额桌宠（Windows 原版）
+  上游仓库   ：https://github.com/VKmich16/VK-1
+  上游作者   ：VKmich16
+  形态源头   ：https://github.com/MeteorNOX/DeepSeek-Balance-Whale-Widget
+              （MeteorNOX/DeepSeek-Balance-Whale-Widget，DSH 界面内的余额挂件）
+
+涉及的文件与部分：
+
+  sprite.png                    角色贴图
+  characters/sprite-*.png       可选角色贴图（Claude / Gemini / GPT / DSH 及 detailed 变体）
+  hit.mp3                       打击音效
+  make_sprite.ps1               贴图生成脚本（针对上游贴图的黑屏四角标定）
+  账本 / 扣费 / 动画架构         源码中「按步长扣费、拆步长补扣、红闪抖动、飘字」这套
+                                设计与实现逻辑沿用上游
+
+上游仓库在其 README 中明确声明：
+
+  「上游暂未附带许可证；本仓库保留来源说明，不对上游代码和素材另行授予许可。」
+
+因此，上述素材与架构**仅随本项目的安装包 / 便携版原样分发，用于运行本软件**。
+如需在其他项目中使用，请自行向上游作者取得许可，不要从本仓库提取再分发，也不要商用。
+
+本项目的原创部分为：WorkBuddy 积分数据源接入、凭证获取与解析流程、单文件 exe 打包方案、
+向导式安装包与卸载器、凭证弹窗与高 DPI 布局适配、双启动器、离线自检体系、以及本项目文档。
+
+--------------------------------------------------------------------------------
+免责声明
+--------------------------------------------------------------------------------
+
+本项目与 WorkBuddy 官方无关，是非官方第三方挂件。使用者需自行从浏览器获取自己的
+登录凭证，凭证仅保存在本机。因使用本软件产生的任何后果由使用者自行承担。
