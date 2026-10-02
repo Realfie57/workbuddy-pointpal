@@ -194,6 +194,16 @@ powershell -NoProfile -ExecutionPolicy Bypass -File _build_setup_inline.ps1
 
 **感谢以上原作者，没有他们的工作就没有这个项目。** 详细来源与授权说明见 [LICENSE](LICENSE)。
 
+### 贡献者
+
+除了原作者，还要特别感谢在开发过程中实机测试、报 bug 的朋友：
+
+| 贡献者 | 贡献 |
+|---|---|
+| [@lvxq8](https://github.com/lvxq8) | 多轮实机测试与缺陷报告：非系统盘（`E:\`）安装下双启动器失效、凭证流程边界情况等，直接推动了 v1.2.16 的修复 |
+
+欢迎提交 [Issue](https://github.com/Realfie57/workbuddy-pointpal/issues) 反馈问题，你的每一次实测反馈都会被认真对待。
+
 > 本项目与 WorkBuddy 官方无关，是非官方第三方挂件。凭证只保存在你自己电脑上，
 > 程序除了向 WorkBuddy 计费接口读余额之外不做任何网络请求。
 
