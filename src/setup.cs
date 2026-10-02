@@ -37,7 +37,7 @@ using Microsoft.Win32;
 
 public static class PointPalSetup {
     public const string Product   = "WorkBuddy PointPal";
-    public const string Version   = "1.2.13";
+    public const string Version   = "1.2.14";
     public const string Publisher = "Realfie";
     public const string PetExe    = "WorkBuddy PointPal.exe";
     public const string UninstExe = "Uninstall.exe";

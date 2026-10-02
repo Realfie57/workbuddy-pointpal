@@ -1548,9 +1548,19 @@ public sealed class WbPet : Form {
             using (HttpClientHandler h = new HttpClientHandler()) {
                 h.AllowAutoRedirect = false;   // we want the 302, not its target
                 h.UseCookies = false;
-                // Same reason as the gateway client: this machine carries a
-                // local HTTP_PROXY interceptor that would otherwise swallow it.
-                try { h.UseProxy = false; } catch { }
+                // Keep the handler's DEFAULT proxy behaviour: HttpClientHandler
+                // routes through the system (WinINET) proxy, which is exactly
+                // what accelerator tools such as Clash write when the user turns
+                // on their "system proxy" mode. Forcing UseProxy = false made
+                // this check fail outright on any machine where github.com is
+                // only reachable through such a proxy (reported 2026-10-02 on
+                // v1.2.13: the browser could open GitHub, the pet could not).
+                //
+                // The guard was originally added to dodge a local HTTP_PROXY
+                // interceptor. That reasoning did not hold: .NET Framework never
+                // reads the HTTP_PROXY environment variable (only .NET Core and
+                // later do), so the interceptor was never in play on this path
+                // anyway - the line only ever hurt users behind a proxy.
                 using (HttpClient c = new HttpClient(h)) {
                     c.Timeout = TimeSpan.FromSeconds(10);
                     c.DefaultRequestHeaders.TryAddWithoutValidation(
@@ -1583,7 +1593,9 @@ public sealed class WbPet : Form {
         try {
             using (HttpClientHandler h = new HttpClientHandler()) {
                 h.UseCookies = false;
-                try { h.UseProxy = false; } catch { }
+                // Same as FetchLatestTagFor: keep the system proxy so this API
+                // fallback also works behind an accelerator. See the longer note
+                // there for why UseProxy = false was removed.
                 using (HttpClient c = new HttpClient(h)) {
                     c.Timeout = TimeSpan.FromSeconds(10);
                     c.DefaultRequestHeaders.TryAddWithoutValidation("Accept", "application/vnd.github+json");

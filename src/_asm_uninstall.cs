@@ -17,6 +17,6 @@ using System.Runtime.InteropServices;
 [assembly: AssemblyProduct("WorkBuddy PointPal")]
 [assembly: AssemblyCompany("Realfie")]
 [assembly: AssemblyCopyright("Copyright (C) Realfie")]
-[assembly: AssemblyVersion("1.2.13.0")]
-[assembly: AssemblyFileVersion("1.2.13.0")]
+[assembly: AssemblyVersion("1.2.14.0")]
+[assembly: AssemblyFileVersion("1.2.14.0")]
 [assembly: ComVisible(false)]
