@@ -1668,61 +1668,79 @@ public sealed class WbPet : Form {
     }
 
     static string FetchLatestTagFor(string owner, string repo) {
+        // Two transports, and this order matters.
+        //
+        // Accelerator tools write the system (WinINET) proxy in their "system
+        // proxy" mode, and that is the only way out while it is active: a
+        // direct socket just times out (reported 2026-10-02 on v1.2.13, where
+        // the browser could open GitHub and the pet never could).
+        //
+        // The same tools LEAVE THAT SETTING BEHIND when the user switches to
+        // TUN mode. The port stops listening and every proxied connection is
+        // refused instantly (measured on this machine 2026-10-02 on v1.2.16,
+        // where forcing the proxy again broke the check a second time).
+        //
+        // So: proxy first, because a refusal costs milliseconds, while a direct
+        // attempt against a blocked network costs a full timeout. One wasted
+        // timeout on a proxy-only machine is the price of working on both,
+        // and both beats being broken.
+        foreach (bool viaProxy in new bool[] { true, false }) {
+            string tag = FetchTagOnce(owner, repo, viaProxy);
+            if (!string.IsNullOrEmpty(tag)) return tag;
+        }
+        return null;
+    }
+
+    // One full attempt over ONE transport: the redirect route, then the API
+    // fallback when the redirect answered with something that carried no tag.
+    static string FetchTagOnce(string owner, string repo, bool viaProxy) {
         string url = "https://github.com/" + owner + "/" + repo + "/releases/latest";
         try {
             using (HttpClientHandler h = new HttpClientHandler()) {
                 h.AllowAutoRedirect = false;   // we want the 302, not its target
                 h.UseCookies = false;
-                // Keep the handler's DEFAULT proxy behaviour: HttpClientHandler
-                // routes through the system (WinINET) proxy, which is exactly
-                // what accelerator tools such as Clash write when the user turns
-                // on their "system proxy" mode. Forcing UseProxy = false made
-                // this check fail outright on any machine where github.com is
-                // only reachable through such a proxy (reported 2026-10-02 on
-                // v1.2.13: the browser could open GitHub, the pet could not).
-                //
-                // The guard was originally added to dodge a local HTTP_PROXY
-                // interceptor. That reasoning did not hold: .NET Framework never
-                // reads the HTTP_PROXY environment variable (only .NET Core and
-                // later do), so the interceptor was never in play on this path
-                // anyway - the line only ever hurt users behind a proxy.
+                // viaProxy = true keeps HttpClientHandler's default, i.e. the
+                // system proxy. .NET Framework never reads the HTTP_PROXY
+                // environment variable (only .NET Core and later do), so the
+                // local interceptor an earlier version tried to dodge was never
+                // in play on this path anyway.
+                try { h.UseProxy = viaProxy; } catch { }
                 using (HttpClient c = new HttpClient(h)) {
-                    c.Timeout = TimeSpan.FromSeconds(10);
+                    c.Timeout = TimeSpan.FromSeconds(viaProxy ? 8 : 10);
                     c.DefaultRequestHeaders.TryAddWithoutValidation(
                         "User-Agent", "WorkBuddyPointPal/" + AboutVersion());
                     using (HttpRequestMessage req = new HttpRequestMessage(HttpMethod.Head, url))
                     using (HttpResponseMessage resp = c.SendAsync(req).GetAwaiter().GetResult()) {
                         int code = (int)resp.StatusCode;
                         // 302 is the normal case. Some CDN edges answer 301.
-                        if (code != 301 && code != 302 && code != 303 && code != 307) {
-                            // No release yet -> github returns 404 on /releases/latest.
-                            // Fall through to the API probe, which can tell the
-                            // difference between "no releases" and "not found".
-                            return FetchLatestTagViaApiFor(owner, repo);
+                        if (code == 301 || code == 302 || code == 303 || code == 307) {
+                            Uri loc = resp.Headers.Location;
+                            if (loc != null) {
+                                Match m = Regex.Match(loc.ToString(), @"/releases/tag/([^/?#]+)");
+                                if (m.Success) return Uri.UnescapeDataString(m.Groups[1].Value);
+                            }
                         }
-                        Uri loc = resp.Headers.Location;
-                        if (loc == null) return FetchLatestTagViaApiFor(owner, repo);
-                        Match m = Regex.Match(loc.ToString(), @"/releases/tag/([^/?#]+)");
-                        if (!m.Success) return FetchLatestTagViaApiFor(owner, repo);
-                        return Uri.UnescapeDataString(m.Groups[1].Value);
+                        // Anything else (404 "no release yet" included) falls
+                        // through: the API probe can tell "no releases" apart
+                        // from "not found".
                     }
                 }
             }
-        } catch { return null; }
+        } catch { }
+        return FetchTagViaApiOnce(owner, repo, viaProxy);
     }
 
-    // Fallback only. This one DOES spend API quota, so it runs solely when the
-    // redirect route gave us nothing usable. Anonymous, so no token is needed.
-    static string FetchLatestTagViaApiFor(string owner, string repo) {
+    // Fallback only. This one DOES spend API quota, so it runs second. Both
+    // this and the redirect route are parameterised by transport so the caller
+    // can retry the whole thing the other way round.
+    static string FetchTagViaApiOnce(string owner, string repo, bool viaProxy) {
         string url = "https://api.github.com/repos/" + owner + "/" + repo + "/releases/latest";
         try {
             using (HttpClientHandler h = new HttpClientHandler()) {
                 h.UseCookies = false;
-                // Same as FetchLatestTagFor: keep the system proxy so this API
-                // fallback also works behind an accelerator. See the longer note
-                // there for why UseProxy = false was removed.
+                try { h.UseProxy = viaProxy; } catch { }
                 using (HttpClient c = new HttpClient(h)) {
-                    c.Timeout = TimeSpan.FromSeconds(10);
+                    c.Timeout = TimeSpan.FromSeconds(viaProxy ? 8 : 10);
                     c.DefaultRequestHeaders.TryAddWithoutValidation("Accept", "application/vnd.github+json");
                     c.DefaultRequestHeaders.TryAddWithoutValidation(
                         "User-Agent", "WorkBuddyPointPal/" + AboutVersion());
