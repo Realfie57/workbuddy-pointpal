@@ -420,7 +420,10 @@ sealed class AboutDialog : Form {
         _updateLabel = updateLabel;
         Text = title;
         FormBorderStyle = FormBorderStyle.FixedDialog;
-        StartPosition = FormStartPosition.CenterParent;
+        // CenterScreen, NOT CenterParent: the owner is the pet itself, which is a
+        // small always-on-top form parked in a screen corner - so CenterParent
+        // puts this dialog in that same corner instead of in front of the user.
+        StartPosition = FormStartPosition.CenterScreen;
         MaximizeBox = false; MinimizeBox = false;
         ShowInTaskbar = false;
         TopMost = true;
@@ -1416,6 +1419,11 @@ public sealed class WbPet : Form {
             Console.WriteLine("  aboutHasUpdateBtn=" + hasUpd);
             Console.WriteLine("  aboutUpdateRequestedDefault=" + d.UpdateRequested);
             Console.WriteLine("  aboutTitle=" + d.Text);
+            // CenterScreen, not CenterParent: the parent is the pet, which lives
+            // in a screen corner, so CenterParent would exile this dialog to that
+            // same corner. Assert it here so a revert is caught offline.
+            Console.WriteLine("  aboutCenteredOnScreen=" +
+                (d.StartPosition == FormStartPosition.CenterScreen));
         }
         Console.WriteLine(bad == 0 ? "UPD TEST: ALL PASS" : "UPD TEST: FAILURES=" + bad);
     }
