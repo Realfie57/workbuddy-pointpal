@@ -14,8 +14,8 @@ Windows 10 / 11 · 免安装 · 无需 Node / .NET SDK · 不联网也能跑（�
 
 | 文件 | 说明 |
 |---|---|
-| `WorkBuddyPointPal-Setup-v1.2.14.exe` | **向导式安装包（推荐）**。可选安装目录、桌面/开始菜单快捷方式、开机自启、「WorkBuddy & PointPal」双启动器 |
-| `WorkBuddyPointPal-Portable-v1.2.14.zip` | **便携版**，解压即用，不写注册表、不进「应用和功能」 |
+| `WorkBuddyPointPal-Setup-v1.2.15.exe` | **向导式安装包（推荐）**。可选安装目录、桌面/开始菜单快捷方式、开机自启、「WorkBuddy & PointPal」双启动器 |
+| `WorkBuddyPointPal-Portable-v1.2.15.zip` | **便携版**，解压即用，不写注册表、不进「应用和功能」 |
 
 > 首次运行会弹出一个凭证输入框——WorkBuddy 没有公开 API Key，需要你从浏览器复制一次登录凭证
 > （一段 cURL 即可，程序自动提取 Cookie + User-Agent）。见下方「第一次使用」。

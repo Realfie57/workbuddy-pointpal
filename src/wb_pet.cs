@@ -412,6 +412,121 @@ sealed class InputDialog : Form {
 // InputDialog, and with AutoScaleMode off for the same reason: this process is
 // DPI aware, so letting the framework scale on top of our own scaling would
 // double every dimension.
+// ------------------------------------------------------- update found -----
+//
+// "A newer version is available". Deliberately NOT a MessageBox: a MessageBox
+// cannot relabel its buttons, so the choice reads as "confirm / decline the
+// update" while the only effect of confirming is opening a browser tab.
+// Reported 2026-10-02 by the first external user, who could not tell what OK
+// would do without pressing it.
+//
+// Laid out with the same hand-scaled P() helper as InputDialog / AboutDialog,
+// and AutoScaleMode off for the same reason: this process is DPI aware, so the
+// framework's own font scaling would stack on top of ours and double every
+// dimension. Text heights are MEASURED, never guessed - a hand-picked number
+// is how the note line starts clipping, and a clipped note reads as "that's
+// all there is".
+sealed class UpdateFoundDialog : Form {
+    public bool OpenRequested;
+
+    readonly Label _body;
+    readonly Label _note;
+    readonly Button _open;
+    readonly Button _later;
+
+    public UpdateFoundDialog(string title, string body, string note,
+                             string openLabel, string laterLabel) {
+        Text = title;
+        FormBorderStyle = FormBorderStyle.FixedDialog;
+        // CenterScreen, NOT CenterParent: the owner is the pet itself, a small
+        // always-on-top form parked in a screen corner.
+        StartPosition = FormStartPosition.CenterScreen;
+        MaximizeBox = false; MinimizeBox = false;
+        ShowInTaskbar = false;
+        TopMost = true;
+        AutoScaleMode = AutoScaleMode.None;
+        try { if (WbPet.AppIcon != null) Icon = WbPet.AppIcon; } catch { }
+
+        int w = InputDialog.Ps(430);
+        int pad = InputDialog.Ps(16);
+        int textW = w - pad * 2;
+
+        _body = new Label();
+        _body.Text = body;
+        _body.AutoSize = false;               // Bounds height is authoritative
+        _body.Font = new Font("Microsoft YaHei", 9.75F);
+
+        _note = new Label();
+        _note.Text = note;
+        _note.AutoSize = false;
+        _note.ForeColor = SystemColors.GrayText;
+
+        // MeasureText returns PHYSICAL pixels (the font is already DPI scaled),
+        // so these heights must NOT go through Ps() a second time.
+        Size bodyNeed = TextRenderer.MeasureText(
+            body, _body.Font, new Size(textW, int.MaxValue), TextFormatFlags.WordBreak);
+        Size noteNeed = TextRenderer.MeasureText(
+            note, _note.Font, new Size(textW, int.MaxValue), TextFormatFlags.WordBreak);
+        int bodyH = bodyNeed.Height + InputDialog.Ps(4);
+        int noteH = noteNeed.Height + InputDialog.Ps(4);
+
+        int noteY = pad + bodyH + InputDialog.Ps(10);
+        int btnH  = InputDialog.Ps(30);
+        int rowY  = noteY + noteH + InputDialog.Ps(16);
+        ClientSize = new Size(w, rowY + btnH + pad);
+        _body.Bounds = new Rectangle(pad, pad, textW, bodyH);
+        _note.Bounds = new Rectangle(pad, noteY, textW, noteH);
+
+        // Primary action on the right - the Windows convention.
+        int laterW = InputDialog.Ps(104);
+        int openW  = InputDialog.Ps(150);
+        int gap    = InputDialog.Ps(8);
+        int openX  = w - pad - openW;
+        int laterX = openX - gap - laterW;
+
+        _open = new Button();
+        _open.Text = openLabel;
+        _open.Bounds = new Rectangle(openX, rowY, openW, btnH);
+        _open.Click += delegate {
+            OpenRequested = true;
+            DialogResult = DialogResult.OK;
+            Close();
+        };
+
+        _later = new Button();
+        _later.Text = laterLabel;
+        _later.Bounds = new Rectangle(laterX, rowY, laterW, btnH);
+        _later.Click += delegate {
+            DialogResult = DialogResult.Cancel;
+            Close();
+        };
+
+        Controls.Add(_body);
+        Controls.Add(_note);
+        Controls.Add(_open);
+        Controls.Add(_later);
+        AcceptButton = _open;    // Enter = open the download page
+        CancelButton = _later;   // Esc   = later
+    }
+
+    // What --updfound asserts. The captions ARE the point of this class, and
+    // the note is the one line whose clipping is invisible in a screenshot (a
+    // dropped sentence just reads as "that's all there is").
+    public string LayoutReport() {
+        Size bodyNeed = TextRenderer.MeasureText(
+            _body.Text, _body.Font, new Size(_body.Width, int.MaxValue), TextFormatFlags.WordBreak);
+        Size noteNeed = TextRenderer.MeasureText(
+            _note.Text, _note.Font, new Size(_note.Width, int.MaxValue), TextFormatFlags.WordBreak);
+        return "bodyFits=" + (bodyNeed.Height <= _body.Height) +
+               " noteFits=" + (noteNeed.Height <= _note.Height) +
+               " buttonsClear=" + (_open.Top >= _note.Bottom) +
+               " laterLeftOfOpen=" + (_later.Right <= _open.Left) +
+               " open=\"" + _open.Text + "\"" +
+               " later=\"" + _later.Text + "\"" +
+               " client=" + ClientSize.Width + "x" + ClientSize.Height;
+    }
+}
+
 sealed class AboutDialog : Form {
     readonly string _updateLabel;
     public bool UpdateRequested;
@@ -711,6 +826,11 @@ public sealed class WbPet : Form {
     const string S_UPDCUR  = "\u5F53\u524D\u7248\u672C";                         // current version
     const string S_UPDOPEN = "\u6253\u5F00\u4E0B\u8F7D\u9875\u9762";             // open download page
     const string S_UPDLATER= "\u7A0D\u540E\u518D\u8BF4";                         // later
+    // Shown inside the dialog. Relabelled buttons alone still leave "what is
+    // actually going to happen" to be guessed at (reported 2026-10-02: the old
+    // MessageBox offered only "new version / current version" above an OK
+    // button, and the user could not tell that OK would open a browser).
+    const string S_UPDNOTE = "\u70B9\u300C\u6253\u5F00\u4E0B\u8F7D\u9875\u9762\u300D\u5C06\u5728\u6D4F\u89C8\u5668\u4E2D\u67E5\u770B\u4E0B\u8F7D\u5730\u5740\u3002";
     // The repo the check points at. Keep in step with the installer's
     // Publisher/Product when the project ever moves.
     const string UPD_OWNER = "Realfie57";
@@ -755,7 +875,7 @@ public sealed class WbPet : Form {
         "--selftest", "--shot", "--credtest", "--credcheck",
         "--soundtest", "--soundprobe", "--soundsoak", "--soundab", "--simchain",
         "--abouttest", "--aboutsheet", "--toksheet", "--updtest", "--updsheet",
-        "--updnet"
+        "--updnet", "--updfound"
     };
     public static bool IsTestMode(string[] args) {
         foreach (string a in args)
@@ -1367,11 +1487,16 @@ public sealed class WbPet : Form {
 
         string msg = S_UPDNEW + "\uFF1A" + latest + "\r\n" +
                      S_UPDCUR + "\uFF1A" + cur;
-        DialogResult r = MessageBox.Show(this, msg, S_UPDFOUND,
-                                         MessageBoxButtons.OKCancel, MessageBoxIcon.Information,
-                                         MessageBoxDefaultButton.Button1);
-        // OK on the message box maps to "open the page"; Cancel is "later".
-        if (r == DialogResult.OK) OpenReleasePage(latest);
+        // A MessageBox cannot relabel its buttons, so "OK / Cancel" would read
+        // as "confirm / decline the update" when the only effect of OK is
+        // opening a browser tab (reported 2026-10-02). Use a real form whose
+        // captions say what they do, plus a line spelling it out.
+        using (UpdateFoundDialog dlg = new UpdateFoundDialog(
+                   S_UPDFOUND, msg, S_UPDNOTE, S_UPDOPEN, S_UPDLATER)) {
+            dlg.ShowDialog(this);
+            // "later" leaves everything untouched - no download, no file write.
+            if (dlg.OpenRequested) OpenReleasePage(latest);
+        }
     }
 
     // --updtest: prove the update-check logic on the SHIPPED binary. Nothing
@@ -1700,6 +1825,37 @@ public sealed class WbPet : Form {
         Console.WriteLine("  fail     = " + S_UPDFAIL);
         Console.WriteLine("  failmsg  = " + S_UPDFAILP);
         Console.WriteLine("updsheet written: " + dir);
+    }
+
+    // --updfound <png>: render the "new version found" dialog itself, so the
+    // button captions and the note line can be reviewed without waiting for a
+    // real release to appear. Purely local - no network. The layout assertion
+    // rides along because the note is the line whose clipping a screenshot
+    // hides: a dropped sentence just reads as "that's all there is".
+    public void SaveUpdateFoundSheet(string path) {
+        // A deliberately fictional version, so a screenshot can never be
+        // mistaken for a real "update available" notification.
+        string body = S_UPDNEW + "\uFF1A" + "v9.9.9" + "\r\n" +
+                      S_UPDCUR + "\uFF1A" + AboutVersion();
+        using (UpdateFoundDialog d = new UpdateFoundDialog(
+                   S_UPDFOUND, body, S_UPDNOTE, S_UPDOPEN, S_UPDLATER)) {
+            d.StartPosition = FormStartPosition.Manual;
+            d.Location = new Point(-10000, -10000);
+            d.Show();
+            DateTime deadline = DateTime.UtcNow.AddSeconds(2);
+            while (DateTime.UtcNow < deadline) {
+                Application.DoEvents();
+                System.Threading.Thread.Sleep(30);
+                break;   // one settle pass is enough for a static dialog
+            }
+            Console.WriteLine("updfound: " + d.LayoutReport());
+            using (Bitmap b = new Bitmap(d.Width, d.Height)) {
+                d.DrawToBitmap(b, new Rectangle(0, 0, d.Width, d.Height));
+                b.Save(path, ImageFormat.Png);
+            }
+            d.Close();
+        }
+        Console.WriteLine("updfound written: " + path);
     }
 
     // --updnet <owner/repo>: hit the REAL network once and print what the
@@ -3213,6 +3369,18 @@ public sealed class WbPet : Form {
             string dst = (sheetIdx + 1 < args.Length) ? args[sheetIdx + 1] : "aboutsheet.png";
             pet.GoOffline();
             pet.SaveAboutSheet(dst);
+            Application.Exit();
+            return;
+        }
+
+        // --updfound <png>: render the "new version found" dialog. A MessageBox
+        // cannot relabel its buttons, so this prompt is a real form whose
+        // captions and note line are worth checking on the shipped binary.
+        int foundIdx = Array.IndexOf(args, "--updfound");
+        if (foundIdx >= 0) {
+            string dst = (foundIdx + 1 < args.Length) ? args[foundIdx + 1] : "updfound.png";
+            pet.GoOffline();
+            pet.SaveUpdateFoundSheet(dst);
             Application.Exit();
             return;
         }
