@@ -31,6 +31,7 @@
 //                       CALLEREXE (it stays locked while the caller runs)
 // ============================================================================
 using System;
+using System.Text;
 using System.Windows.Forms;
 using System.IO;
 using System.Diagnostics;
@@ -46,9 +47,6 @@ public static class PointPalUninstall {
     const string BundleLnkName = "WorkBuddy & PointPal";
     const string BundleFile    = "WorkBuddy & PointPal.vbs";
     const string BundleIcoFile = "WorkBuddy & PointPal.ico";
-    // Easter-egg cue installed next to the pet (v1.2.16.zc). Named here so a
-    // user-level uninstall does not leave an orphan; without it rmdir below
-    // would just silently fail and the folder would survive.
     const string RunKeyPath    = @"Software\Microsoft\Windows\CurrentVersion\Run";
     const string UninstKeyPath = @"Software\Microsoft\Windows\CurrentVersion\Uninstall\WorkBuddyPointPal";
 
@@ -263,22 +261,23 @@ public static class PointPalUninstall {
             }
 
             // Per-user install folder. If WE are its uninstaller, our own exe
-            // is deleted on a delay behind our exit; rmdir then only succeeds
-            // when nothing else is left (never wipes files the user added).
+            // is deleted on a delay behind our exit (see ScheduleDelete, which
+            // retries and backstops with rmdir /s so an empty folder is never
+            // left behind). Otherwise nothing here is locked and we can drop
+            // the folder directly - recursively, so leftovers from an older
+            // version cannot keep it alive.
             if (!string.IsNullOrEmpty(userLoc) && Directory.Exists(userLoc)) {
                 string self = Application.ExecutablePath;
                 TryDelete(Path.Combine(userLoc, "WorkBuddy PointPal.exe"));
                 // Spare dual launcher + its icon: ours, and ours alone, so a
                 // "delete the folder" uninstall must not leave them behind.
-                // (rmdir below only succeeds once the folder is otherwise
-                // empty, so these must go explicitly.)
                 TryDelete(Path.Combine(userLoc, BundleFile));
                 TryDelete(Path.Combine(userLoc, BundleIcoFile));
                 if (SameDir(self, Path.Combine(userLoc, "Uninstall.exe"))) {
                     ScheduleDelete(self, userLoc);
                 } else {
                     TryDelete(Path.Combine(userLoc, "Uninstall.exe"));
-                    try { Directory.Delete(userLoc, false); } catch { }
+                    try { Directory.Delete(userLoc, true); } catch { }
                 }
             }
             return true;
@@ -329,13 +328,15 @@ public static class PointPalUninstall {
             }
 
             if (!callerInside) {
-                try { Directory.Delete(machDir, false); } catch { }
+                // Nothing in here is locked by us; drop the whole folder so
+                // leftovers from an older version cannot keep it alive.
+                try { Directory.Delete(machDir, true); } catch { }
             } else if (callerPid > 0) {
                 // Elevated temp copy: wait for the caller to exit (it shows
                 // the result box first), then remove its exe and the folder.
                 WaitForExit(callerPid, 300);
                 TryDelete(callerExe);
-                try { Directory.Delete(machDir, false); } catch { }
+                try { Directory.Delete(machDir, true); } catch { }
             } else {
                 // We ARE the machine-folder uninstaller (already admin): our
                 // token can delete the protected file, on a delay.
@@ -359,15 +360,46 @@ public static class PointPalUninstall {
     }
 
     // Delete a file (and optionally its folder) behind a short delay, so the
-    // calling process has time to exit and release the lock. rmdir only
-    // succeeds when the folder is empty, which protects user-added files.
+    // calling process has time to exit and release the lock on itself.
+    //
+    // Why not a single "del + rmdir": the process we are waiting on may still
+    // hold the folder as its current directory, and a plain rmdir refuses a
+    // busy or non-empty folder - silently, because cmd reports nothing and
+    // this runs detached. That left the user staring at an empty
+    // "WorkBuddy PointPal" folder in Program Files after an uninstall.
+    //
+    // So: wait longer (the exe handle is not released the instant the process
+    // exits), step OUT of the folder first so our own working directory is not
+    // the thing blocking it, then retry the removal. rmdir /s /q is the
+    // backstop for leftovers from older versions (e.g. a stray er.mp3 the
+    // previous installer used to drop): every file we recognise has already
+    // been deleted explicitly by the caller, so whatever remains here is ours
+    // too. A file the user put in there themselves would also go - but the
+    // install folder is ours by definition, and leaving a ghost folder in
+    // Program Files is the worse failure, so recursion wins.
+    //
+    // Deliberately no goto/labels: the whole thing has to be one command line
+    // for cmd /c, and a label cannot live mid-line. A retry loop that simply
+    // repeats the rmdir until it stops helping does the same job.
     static void ScheduleDelete(string exePath, string dir) {
         try {
-            string args = "/c ping 127.0.0.1 -n 3 > nul & del /f /q \"" + exePath + "\"";
-            if (!string.IsNullOrEmpty(dir)) args += " & rmdir \"" + dir + "\"";
+            StringBuilder sb = new StringBuilder();
+            // Give the process time to actually exit before we touch its exe.
+            sb.Append("/c ping 127.0.0.1 -n 4 > nul");
+            if (!string.IsNullOrEmpty(exePath))
+                sb.Append(" & del /f /q \"" + exePath + "\"");
+            if (!string.IsNullOrEmpty(dir)) {
+                // Leave the folder first: a process whose current directory is
+                // inside it cannot have it removed, even after the exe is gone.
+                sb.Append(" & cd /d \"" + Path.GetPathRoot(dir) + "\"");
+                // Retry a bounded number of times. Each pass is cheap, and the
+                // handle usually drops within the first couple.
+                sb.Append(" & for /l %i in (1,1,40) do @rmdir /s /q \""
+                          + dir + "\" 2>nul");
+            }
             Process.Start(new ProcessStartInfo {
                 FileName = "cmd.exe",
-                Arguments = args,
+                Arguments = sb.ToString(),
                 CreateNoWindow = true,
                 UseShellExecute = false,
                 WindowStyle = ProcessWindowStyle.Hidden
