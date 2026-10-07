@@ -14,8 +14,8 @@ Windows 10 / 11 · 免安装 · 无需 Node / .NET SDK · 不联网也能跑（�
 
 | 文件 | 说明 |
 |---|---|
-| `WorkBuddyPointPal-Setup-v1.2.16.exe` | **向导式安装包（推荐）**。可选安装目录、桌面/开始菜单快捷方式、开机自启、「WorkBuddy & PointPal」双启动器 |
-| `WorkBuddyPointPal-Portable-v1.2.16.zip` | **便携版**，解压即用，不写注册表、不进「应用和功能」 |
+| `WorkBuddyPointPal-Setup-v1.2.16.zc.exe` | **向导式安装包（推荐）**。可选安装目录、桌面/开始菜单快捷方式、开机自启、「WorkBuddy & PointPal」双启动器 |
+| `WorkBuddyPointPal-Portable-v1.2.16.zc.zip` | **便携版**，解压即用，不写注册表、不进「应用和功能」 |
 
 > 首次运行会弹出一个凭证输入框——WorkBuddy 没有公开 API Key，需要你从浏览器复制一次登录凭证
 > （一段 cURL 即可，程序自动提取 Cookie + User-Agent）。见下方「第一次使用」。
@@ -30,6 +30,29 @@ Windows 10 / 11 · 免安装 · 无需 Node / .NET SDK · 不联网也能跑（�
 
 ---
 
+## 双启动器：一次点击，桌宠和 WorkBuddy 一起起来
+
+这是本项目的一个特色功能。装好之后，安装程序会在桌面放一个「**WorkBuddy & PointPal**」快捷方式：
+
+<img src="docs/preview-bundler.png" width="120" alt="WorkBuddy & PointPal 双启动器">
+
+双击它，会**同时把桌宠和 WorkBuddy 本体带起来**——不用再分别去点两个图标。
+
+几个细节：
+
+- **先桌宠、后 WorkBuddy**：桌宠先起来（它要读凭证、开始轮询余额），随即拉起 WorkBuddy；
+- **桌宠不会开出第二只**：启动前会先查进程表，桌宠已经在跑就跳过，只补上 WorkBuddy；
+- **WorkBuddy 装在哪个盘都找得到**。WorkBuddy 本体没有卸载项、也没有注册表路径键，所以它只能靠这三条线索找：
+  1. **`wb-path.txt`** —— 脚本旁边放这个文件，里面写一行 `WorkBuddy.exe` 的完整路径。这是**手动兜底**，任何自动方式都搞不定的机器靠它。文件不存在就自动跳过；
+  2. **开始菜单快捷方式** —— 递归扫描当前用户和所有用户的开始菜单，读快捷方式指向的真实路径。这是**最可靠的一条**，因为你装到哪个盘它就跟着到哪个盘；
+  3. **全盘扫描** —— 遍历所有就绪的本地磁盘和移动盘，查 `Program Files\WorkBuddy` 等常见位置。
+  三层都落空时，最后还会试几个固定路径兜底；如果**全部失败**，它会**弹出提示框**告诉你怎么用 `wb-path.txt` 手动指定，而不是默默什么都不做；
+- **专属图标**：快捷方式用的是 `WorkBuddy_fake_icon.ico`（照着 WorkBuddy 风格自己做的），所以它能正常固定到任务栏。
+
+> 想单独启动桌宠、不要 WorkBuddy，双击安装目录里的「**启动 WorkBuddy PointPal.vbs**」即可。
+
+---
+
 ## 第一次使用
 
 1. 浏览器打开 [www.workbuddy.cn](https://www.workbuddy.cn) 并登录；
@@ -38,7 +61,7 @@ Windows 10 / 11 · 免安装 · 无需 Node / .NET SDK · 不联网也能跑（�
 4. 回到桌宠，在弹出的输入框里**整段粘贴**。
 
 程序会自动提取 Cookie 和 User-Agent 并校验。凭证输入框左下角有「**如何获取凭证...**」按钮，
-忘了步骤随时点开。安装后也能随时**右键桌宠 →「设置登录凭证」**重新设置。
+忘了步骤随时点开。安装后也能随时通过**右键桌宠 → 「设置登录凭证」**重新设置。
 
 > **为什么必须带 User-Agent？** 网关把登录会话**绑定到浏览器 User-Agent**——
 > 同一 Cookie，UA 差一个版本号都 401；只粘 Cookie 不粘 UA 也 401。
@@ -60,12 +83,15 @@ Windows 10 / 11 · 免安装 · 无需 Node / .NET SDK · 不联网也能跑（�
 
 余额下降时红闪 + 音效 + `-N` 飘字；余额**上升**时显示绿色提示，不播放打击音效。
 
+> **彩蛋**：把扣费步长在「自定义…」里设成 `3.25`、`32.5` 或 `325`，命中音效会换成另一段录音。
+> 这三档**故意没列在步长菜单里**——彩蛋要自己发现才有意思。
+
 ---
 
 ## 检查更新
 
 右键 →「**关于…**」→ 左下角「**检查更新**」：关于框关闭，弹出「正在检查更新…」，
-查到后**至少停留 0.7 秒**再给结果——已是最新就显示当前版本号，有新版本就并列显示新旧两个号，
+已是最新就显示当前版本号，有新版本就并列显示新旧两个号，
 并给一个「**打开下载页面**」按钮跳到 GitHub。
 
 > **只提示，不自动更新。** 程序不会偷偷下载或替换文件。不点「检查更新」就完全没有网络请求。
@@ -144,7 +170,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File _build_setup_inline.ps1
 │   ├── build_setup.ps1
 │   └── make_sprite.ps1        从原图重新生成 sprite.png 并量出黑屏四角
 ├── sprite.png                 角色贴图（黑屏留给余额文字）
-├── hit.mp3                    打击音效
+├── hit.mp3                    打击音效（默认）
+├── er.mp3                     彩蛋音效（扣费步长 3.25 / 32.5 / 325 时替换 hit.mp3）
 ├── characters/                可选角色（Claude / Gemini / GPT / DSH）
 ├── DaFeiYu.ico                应用图标（exe / 托盘 / 输入框）
 ├── WorkBuddy_fake_icon.ico    双启动器快捷方式专属图标
@@ -172,7 +199,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File _build_setup_inline.ps1
 .\WorkBuddy PointPal.exe --credtest        # 凭证解析器（内置"用户 token.txt 未被改动"守卫）
 .\WorkBuddy PointPal.exe --abouttest       # 菜单序位 + 版本
 .\WorkBuddy PointPal.exe --toksheet x.png  # 把凭证弹窗渲染成图，并打印布局自检
-.\WorkBuddy PointPal.exe --updtest         # 检查更新：14 组版本号比较 + URL 形状 + 0.7s 下限（离线）
+.\WorkBuddy PointPal.exe --updtest         # 检查更新：14 组版本号比较 + URL 形状（离线）
 .\WorkBuddy PointPal.exe --updnet cli/cli  # 检查更新：唯一联网模式，验证 302 跳转路径可用
 ```
 
