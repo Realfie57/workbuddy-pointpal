@@ -57,9 +57,6 @@ public static class PointPalSetup {
     // shortcut must name one explicitly. We ship a WorkBuddy-branded icon
     // (distinct from the pet's own DaFeiYu.ico) and drop it next to the
     // launcher at install time.
-    // Easter-egg cue (v1.2.16.zc): shipped next to the pet so a machine that
-    // never had it can still play it. ASCII name, addressed by bare name.
-    public const string EggFile       = "er.mp3";
     public const string BundleIcoRes  = "WorkBuddy_fake_icon.ico";
     public const string BundleIcoFile = "WorkBuddy & PointPal.ico";
     // The dual-launcher shortcut MUST target an executable, or Windows will
@@ -554,10 +551,13 @@ public static class PointPalSetup {
             // needs an explicit one. Ship it alongside (always, for the same
             // reason as the launcher itself).
             ExtractResRetry(BundleIcoRes, Path.Combine(dir, BundleIcoFile));
-            // Easter-egg cue. A portable exe unpacks its own copy into the data
-            // folder, but an INSTALLED pet reads the install directory (the
-            // launcher starts it from there), so the file has to be laid down.
-            ExtractResRetry(EggFile, Path.Combine(dir, EggFile));
+            // NOTE: er.mp3 is deliberately NOT laid down here. The pet reads
+            // every asset from its DATA folder (%LOCALAPPDATA%\WorkBuddy
+            // PointPal\), which it unpacks from its own embedded copy on each
+            // launch (see WbPet.ExtractResources). An earlier version dropped
+            // a spare er.mp3 into the install folder on the theory that an
+            // installed pet reads from there - it does not, so that file was
+            // never opened and just sat in Program Files looking like junk.
 
             string deskDir = Environment.GetFolderPath(machine
                 ? Environment.SpecialFolder.CommonDesktopDirectory

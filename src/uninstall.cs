@@ -49,7 +49,6 @@ public static class PointPalUninstall {
     // Easter-egg cue installed next to the pet (v1.2.16.zc). Named here so a
     // user-level uninstall does not leave an orphan; without it rmdir below
     // would just silently fail and the folder would survive.
-    const string EggFile       = "er.mp3";
     const string RunKeyPath    = @"Software\Microsoft\Windows\CurrentVersion\Run";
     const string UninstKeyPath = @"Software\Microsoft\Windows\CurrentVersion\Uninstall\WorkBuddyPointPal";
 
@@ -275,7 +274,6 @@ public static class PointPalUninstall {
                 // empty, so these must go explicitly.)
                 TryDelete(Path.Combine(userLoc, BundleFile));
                 TryDelete(Path.Combine(userLoc, BundleIcoFile));
-                TryDelete(Path.Combine(userLoc, EggFile));
                 if (SameDir(self, Path.Combine(userLoc, "Uninstall.exe"))) {
                     ScheduleDelete(self, userLoc);
                 } else {
