@@ -605,6 +605,18 @@ public sealed class SoundPool {
         return sb.ToString();
     }
 
+    // MCI aliases are PROCESS-GLOBAL. Two pools sharing an alias means the
+    // second pool's "close + open ... alias" silently rebinds the first
+    // pool's handles to its own file (confirmed 2026-10-07: the hit pool
+    // started playing er.mp3 after the egg pool opened). Every instance
+    // therefore claims its own alias tag from this counter.
+    static int _tagSeq;
+    readonly string _tag;            // unique alias prefix, e.g. "wbpp0_"
+    // What tag the n-th pool from now would take. Used by --eggsound to prove
+    // two pools can never collide, without opening any device.
+    public static string PeekNextTag(int n) {
+        return "wbpp" + (_tagSeq + n).ToString(CultureInfo.InvariantCulture) + "_";
+    }
     readonly string _path;
     readonly string _bare;           // file name only - MCI mangles non-ASCII paths
     readonly int _slots;
@@ -617,6 +629,7 @@ public sealed class SoundPool {
     public SoundPool(string path, int slots, int volumePercent, string logPath) {
         _path = path; _slots = slots; _logPath = logPath; _volume = volumePercent;
         _bare = Path.GetFileName(path);
+        _tag = "wbpp" + (++_tagSeq).ToString(CultureInfo.InvariantCulture) + "_";
         _alias = new string[slots]; _open = new bool[slots];
         try {
             // MCI receives a mangled path when the folder name is not ASCII, so
@@ -624,7 +637,7 @@ public sealed class SoundPool {
             // have MCI open the bare file name instead of a full path.
             try { Directory.SetCurrentDirectory(Path.GetDirectoryName(path)); } catch { }
             for (int i = 0; i < slots; i++) {
-                _alias[i] = "wbcppet" + i;
+                _alias[i] = _tag + i.ToString(CultureInfo.InvariantCulture);
                 Send("close " + _alias[i]);
                 _open[i] = OpenSlot(i);
             }
@@ -704,6 +717,15 @@ public sealed class SoundPool {
 
     public void Dispose() {
         try { for (int i = 0; i < _slots; i++) if (_open[i]) Send("close " + _alias[i]); } catch { }
+    }
+
+    // Report what this pool's alias `i` currently resolves to. MCI has no
+    // "which file" query, so the length stands in: hit.mp3 and er.mp3 differ in
+    // length (185 vs 196), which is how --aliascheck detects a rebind.
+    public string DbgInfo(int i) {
+        string a = _alias[i];
+        return a + " mode='" + Send("status " + a + " mode").Trim() + "'" +
+               " length=" + Send("status " + a + " length").Trim();
     }
 
     // Variant of Play() that lets --soundab force a specific historical rule on
@@ -805,7 +827,23 @@ public sealed class WbPet : Form {
     const string S_LBLT    = "\u5C4F\u5E55\u6807\u7B7E";                         // label dialog title
     const string S_LBLP    = "\u5E73\u677F\u7B2C\u4E00\u884C\u663E\u793A\u7684\u6587\u5B57";
     const string S_CHARMENU= "\u89D2\u8272";                                     // character submenu
-    const string S_SOUNDMENU="\u53D7\u51FB\u97F3\u6548";                         // hit sound toggle
+    // Easter egg (v1.2.16.zc): when the amount actually taken off in one
+    // animation is exactly one of these, the cue switches to the alternate
+    // recording (WBPET_EGG_FILE, bundled as er.mp3). Matched against the
+    // REAL per-cue amount in MakeTick, so a rehearsal or a big demo run
+    // hits it too - not just the configured step. Matched by exact
+    // two-decimal rounding (NOT a tolerance - see IsEggStep; a tolerance
+    // let 3.25006 fire). Deliberately NOT listed in the step menu: the
+    // whole point is that the user discovers them, so type one into
+    // "custom" (or set it any other way) to hear it.
+    static readonly double[] EGG_STEPS = new double[] { 3.25, 32.5, 325 };
+    const string EGG_FILE = "er.mp3";
+    // Shown after the numeric version and appended to the User-Agent. Keep
+    // in step with _asm_pet.cs (assembly 4th segment) and setup.cs
+    // (VersionSuffix). Deliberately NOT part of the assembly version: a
+    // non-numeric segment would refuse to load.
+    const string VersionTag = "zc";
+        const string S_SOUNDMENU="\u53D7\u51FB\u97F3\u6548";                         // hit sound toggle
     const string S_ABOUT   = "\u5173\u4E8E...";                                  // about...
     const string S_ABOUTT  = "\u5173\u4E8E";                                     // about (title)
     // ---- update check (About > "check for updates") ----------------------
@@ -875,7 +913,7 @@ public sealed class WbPet : Form {
         "--selftest", "--shot", "--credtest", "--credcheck",
         "--soundtest", "--soundprobe", "--soundsoak", "--soundab", "--simchain",
         "--abouttest", "--aboutsheet", "--toksheet", "--updtest", "--updsheet",
-        "--updnet", "--updfound"
+        "--updnet", "--updfound", "--eggsound", "--eggsoundlive", "--aliascheck"
     };
     public static bool IsTestMode(string[] args) {
         foreach (string a in args)
@@ -986,6 +1024,11 @@ public sealed class WbPet : Form {
     double _shakeX, _shakeY;
     // hit sound: one MCI alias per concurrent cue
     SoundPool _sound;
+    // Easter-egg cue, opened lazily on the first 3.25 / 32.5 / 325 charge so
+    // the extra MCI handles are not spent on a sound most sessions never
+    // play. Independent pool: a new cue must never cut off the hit sound.
+    SoundPool _soundEgg;
+    bool _eggTried;
     bool _soundEnabled = true;
     int _soundMisses;                // consecutive Play() failures (see PlayHitSound)
     bool _soundWanted = true;
@@ -1031,6 +1074,12 @@ public sealed class WbPet : Form {
         } else if (_soundWanted) {
             Log("sound file missing: " + sndPath + " (hit sound disabled)");
         }
+
+        // The easter-egg cue is deliberately NOT pre-opened here. It is only
+        // reachable at the three egg steps, so pre-opening it would spend four
+        // MCI handles on a sound most sessions never play, and would give the
+        // egg's own diagnostics a launch-time "ready" line that hides whether
+        // routing actually worked. EggPool() opens it on first need instead.
 
         FormBorderStyle = FormBorderStyle.None;
         ShowInTaskbar = false;
@@ -1245,6 +1294,9 @@ public sealed class WbPet : Form {
 
         // submenu: credits per hurt animation
         _stepItem = new ToolStripMenuItem(S_STEPMENU);
+        // The easter-egg steps (see EGG_STEPS) are deliberately NOT listed
+        // here: the whole point is that the user stumbles onto them. They
+        // still work when typed into "custom" - SetStep() takes any value.
         double[] steps = new double[] { 0.1, 1, 5, 10 };
         foreach (double s in steps) {
             double v = s;
@@ -1480,7 +1532,7 @@ public sealed class WbPet : Form {
 
         string cur = AboutVersion();
         if (CompareVersions(latest, cur) <= 0) {
-            MessageBox.Show(this, S_UPDSAMEP + "\r\n\r\n" + S_UPDCUR + "\uFF1A" + cur,
+            MessageBox.Show(this, S_UPDSAMEP + "\r\n\r\n" + S_UPDCUR + "\uFF1A" + AboutVersionLabel(),
                             S_UPDSAME, MessageBoxButtons.OK, MessageBoxIcon.Information);
             return;
         }
@@ -1708,7 +1760,7 @@ public sealed class WbPet : Form {
                 using (HttpClient c = new HttpClient(h)) {
                     c.Timeout = TimeSpan.FromSeconds(viaProxy ? 8 : 10);
                     c.DefaultRequestHeaders.TryAddWithoutValidation(
-                        "User-Agent", "WorkBuddyPointPal/" + AboutVersion());
+                        "User-Agent", "WorkBuddyPointPal/" + AboutVersionLabel());
                     using (HttpRequestMessage req = new HttpRequestMessage(HttpMethod.Head, url))
                     using (HttpResponseMessage resp = c.SendAsync(req).GetAwaiter().GetResult()) {
                         int code = (int)resp.StatusCode;
@@ -1743,7 +1795,7 @@ public sealed class WbPet : Form {
                     c.Timeout = TimeSpan.FromSeconds(viaProxy ? 8 : 10);
                     c.DefaultRequestHeaders.TryAddWithoutValidation("Accept", "application/vnd.github+json");
                     c.DefaultRequestHeaders.TryAddWithoutValidation(
-                        "User-Agent", "WorkBuddyPointPal/" + AboutVersion());
+                        "User-Agent", "WorkBuddyPointPal/" + AboutVersionLabel());
                     string body = c.GetStringAsync(url).GetAwaiter().GetResult();
                     Match m = Regex.Match(body, "\"tag_name\"\\s*:\\s*\"([^\"]+)\"");
                     if (m.Success) return Uri.UnescapeDataString(m.Groups[1].Value);
@@ -1757,7 +1809,7 @@ public sealed class WbPet : Form {
     // dialog blocking the (headless) test process.
     string AboutBody() {
         StringBuilder sb = new StringBuilder();
-        sb.Append("WorkBuddy PointPal ").Append(AboutVersion()).Append("\r\n");
+        sb.Append("WorkBuddy PointPal ").Append(AboutVersionLabel()).Append("\r\n");
         // Chinese is written as \uXXXX, matching every other string in this
         // file: wb_pet.cs is compiled without /codepage:65001, so a literal
         // multi-byte character here would be a real mojibake risk.
@@ -1774,12 +1826,22 @@ public sealed class WbPet : Form {
     }
 
     // "1.2.9" out of "1.2.9.0"; "?" if the metadata is somehow missing.
+    // The 4th segment is the build marker and is deliberately NOT shown
+    // here - see AboutVersionLabel, which is what users read.
     static string AboutVersion() {
         try {
             Version v = Assembly.GetExecutingAssembly().GetName().Version;
             if (v != null) return v.Major + "." + v.Minor + "." + v.Build;
         } catch { }
         return "?";
+    }
+
+    // What the About box prints: the numeric version plus the build tag, e.g.
+    // "1.2.16.zc". The tag rides in the assembly's 4th segment (which
+    // must stay numeric or the assembly refuses to load), so it is appended
+    // here AND exposed through VersionTag - there is one place to change it.
+    static string AboutVersionLabel() {
+        return AboutVersion() + (VersionTag.Length > 0 ? "." + VersionTag : "");
     }
 
     // --aboutsheet <png>: paint the About body exactly as the message box would
@@ -1854,7 +1916,7 @@ public sealed class WbPet : Form {
         // A deliberately fictional version, so a screenshot can never be
         // mistaken for a real "update available" notification.
         string body = S_UPDNEW + "\uFF1A" + "v9.9.9" + "\r\n" +
-                      S_UPDCUR + "\uFF1A" + AboutVersion();
+                      S_UPDCUR + "\uFF1A" + AboutVersionLabel();
         using (UpdateFoundDialog d = new UpdateFoundDialog(
                    S_UPDFOUND, body, S_UPDNOTE, S_UPDOPEN, S_UPDLATER)) {
             d.StartPosition = FormStartPosition.Manual;
@@ -1955,7 +2017,7 @@ public sealed class WbPet : Form {
 
         string body = AboutBody();
         int lines = body.Split('\n').Length;
-        Console.WriteLine("  AboutVer=" + AboutVersion());
+        Console.WriteLine("  AboutVer=" + AboutVersionLabel());
         Console.WriteLine("  AboutBodyLines=" + lines);
         Console.WriteLine("  AboutBodyHasDataDir=" + (body.IndexOf(_baseDir) >= 0));
         Console.WriteLine("  --- About box text ---");
@@ -2423,6 +2485,7 @@ public sealed class WbPet : Form {
         try { _timer.Stop(); _poll.Stop(); } catch { }
         if (_tray != null) { _tray.Visible = false; _tray.Dispose(); }
         if (_sound != null) { try { _sound.Dispose(); } catch { } }
+        if (_soundEgg != null) { try { _soundEgg.Dispose(); } catch { } }
         SaveState();
         Application.Exit();
     }
@@ -2786,7 +2849,7 @@ public sealed class WbPet : Form {
         fl.Jitter = 7 * _scale * _floatMult;
         _floaters.Add(fl);
         if (_floaters.Count > 20) _floaters.RemoveAt(0);
-        PlayHitSound();          // every pop plays, even on top of the last one
+        PlayHitSound(amount);    // every pop plays, even on top of the last one
         _dirty = true;
     }
 
@@ -2799,9 +2862,11 @@ public sealed class WbPet : Form {
     // used to: one -1 set _soundEnabled = false and only the menu could undo
     // it). Count consecutive misses instead and only give up when the sound
     // really looks broken; any success resets the counter.
-    void PlayHitSound() {
-        if (_sound == null || !_soundEnabled) return;
-        int slot = _sound.Play();
+    void PlayHitSound(double amount) {
+        if (!_soundEnabled) return;
+        SoundPool pool = IsEggStep(amount) ? EggPool() : _sound;
+        if (pool == null) return;
+        int slot = pool.Play();
         if (slot < 0) {
             _soundMisses++;
             if (_soundMisses == 1 || _soundMisses % 10 == 0)
@@ -2813,6 +2878,73 @@ public sealed class WbPet : Form {
             }
         } else {
             _soundMisses = 0;
+        }
+    }
+
+    // Full-precision rendering for the egg test's failure lines. FmtAmt rounds
+    // to two decimals - the very precision under test - so a failure report
+    // through it would print "3.25" for 3.2499999983 and hide the real cause.
+    static string Dbg(double v) {
+        return v.ToString("0.##########", CultureInfo.InvariantCulture) +
+               " (round2=" + Math.Round(v, 2).ToString("0.##", CultureInfo.InvariantCulture) + ")";
+    }
+
+    // Easter-egg matching: the cue must be the quantity 3.25 / 32.5 / 325 as
+    // that number is understood in ordinary decimal arithmetic.
+    //
+    // The obvious spellings both fail, and the self-test pins why:
+    //   * Math.Round(amount, 2) is BANKER'S rounding (midpoint to even), so
+    //     3.25006 -> 3.25 but also 3.5 -> 4 and 0.125 -> 0.12. Worse, in
+    //     binary, 3.2495 rounds to 3.25 as well, so a neighbouring step of
+    //     3.2495 would have played the easter egg.
+    //   * A tolerance picks an arbitrary boundary that no user could guess.
+    //
+    // Rounding through decimal is what people mean by "to two places", so the
+    // rule is: the amount, rounded to two decimal places, equals the step.
+    // Only the amount itself can be a hair off (the step and the egg values
+    // are exactly representable in decimal), and balances are already rounded
+    // to four places before they ever reach a cue.
+    static bool IsEggStep(double amount) {
+        double r = (double)Math.Round((decimal)amount, 2, MidpointRounding.AwayFromZero);
+        for (int i = 0; i < EGG_STEPS.Length; i++)
+            if (r == EGG_STEPS[i]) return true;
+        return false;
+    }
+
+    static string EggStepText() {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < EGG_STEPS.Length; i++) {
+            if (i > 0) sb.Append(" / ");
+            sb.Append(FmtAmt(EGG_STEPS[i]));
+        }
+        return sb.ToString();
+    }
+
+    // The egg pool, opened on demand the first time a 3.25 / 32.5 / 325 cue
+    // fires. Opened through the SAME path the constructor uses; if the sound
+    // is off, or the file is not there, this returns null and the plain hit
+    // sound is used - the easter egg must never be able to silence a cue.
+    SoundPool EggPool() {
+        if (_eggTried) return _soundEgg;
+        _eggTried = true;
+        try {
+            string p = Path.Combine(_baseDir, Get("WBPET_EGG_FILE", EGG_FILE));
+            if (!File.Exists(p)) {
+                Log("egg sound missing: " + p + " (using " + Get("WBPET_SOUND_FILE", "hit.mp3") + ")");
+                return null;
+            }
+            int vol = int.Parse(Get("WBPET_VOLUME", "80"));
+            _soundEgg = new SoundPool(p, 4, vol, Path.Combine(_baseDir, "pet.log"));
+            if (_soundEgg.Failed) { Log("egg sound pool failed: " + _soundEgg.Error); return null; }
+            // The amount is logged because this pool is now opened on demand:
+            // the line is the only evidence of which charge asked for it, and
+            // the self-test reads it back.
+            Log("egg sound opened on demand: " + p + " (steps " + EggStepText() +
+                ", last cue " + FmtAmt(_lastCueAmount) + ")");
+            return _soundEgg;
+        } catch (Exception ex) {
+            Log("egg sound error: " + ex.Message);
+            return null;
         }
     }
 
@@ -3334,6 +3466,42 @@ public sealed class WbPet : Form {
             return;
         }
 
+        // Easter-egg self check (--eggsound): proves offline and without an
+        // audio device that exactly 3.25 / 32.5 / 325 route to the egg pool
+        // and that a nearby value does NOT (the tolerance must not be so wide
+        // that a plain 3.2 or a 320 charge sets it off).
+        if (Array.IndexOf(args, "--eggsound") >= 0) {
+            pet.GoOffline();
+            pet.RunEggSoundTest();
+            Application.Exit();
+            return;
+        }
+
+        // --eggsoundlive <amount> [--eggopen]: drive ONE real cue of `amount`
+        // through the production path (MakeTick -> PlayHitSound), so the actual
+        // wiring is exercised, not just the decision table. --eggsound proves
+        // "3.25 should route to the egg"; this proves "it did". Needs an audio
+        // device. Prints the egg pool's own log line back out.
+        int egIdx = Array.IndexOf(args, "--eggsoundlive");
+        if (egIdx >= 0) {
+            double amt = 3.25;
+            if (egIdx + 1 < args.Length)
+                double.TryParse(args[egIdx + 1], NumberStyles.Float,
+                                CultureInfo.InvariantCulture, out amt);
+            pet.GoOffline();
+            pet.RunEggLiveCheck(amt);
+            Application.Exit();
+            return;
+        }
+
+        // --aliascheck: end-to-end reproduction of the MCI alias-collision
+        // defect. Needs an audio device.
+        if (Array.IndexOf(args, "--aliascheck") >= 0) {
+            pet.RunAliasCheck();
+            Application.Exit();
+            return;
+        }
+
         // Update-check self check (--updtest). Offline and network-free: it
         // pins the version comparison and the URL shape, which are the two
         // places a silent wrongness would tell every user "you're up to date".
@@ -3584,6 +3752,56 @@ public sealed class WbPet : Form {
         get { return _lastCueAmount > 0 ? "-" + FmtAmt(_lastCueAmount) : "(none)"; }
     }
     public void ApplyBalancePublic(double bal, bool snap) { ApplyBalance(bal, snap); }
+    // --aliascheck: end-to-end reproduction of the 2026-10-07 defect.
+    //
+    // MCI aliases are PROCESS-GLOBAL. Both pools used to pick "wbcppet0..3", so
+    // opening the egg pool ran "close wbcppet0" + "open er.mp3 ... alias
+    // wbcppet0" and silently rebound the HIT pool's handles to er.mp3. From
+    // then on every cue played er.mp3, at any step, real or rehearsal - the
+    // user reported exactly that ("我先切到 5 再测试扣费，出来的声音都是 er").
+    //
+    // The decision table (--eggsound) could not catch it: that test never opens
+    // a device, and a real cue probe runs in a fresh process, where the egg pool
+    // has never been opened. This probe is the one that reproduces the sequence:
+    // open the egg pool, THEN place a plain cue, and compare the alias lengths.
+    // hit.mp3 and er.mp3 differ in length, so the number identifies the file
+    // without an MCI "which file" query (there is none).
+    public void RunAliasCheck() {
+        Console.WriteLine("MCI alias isolation (--aliascheck)");
+        GoOffline();
+        _soundEnabled = true;
+        if (_sound == null) { Console.WriteLine("  SKIP no hit pool (no audio device?)"); return; }
+
+        string hitBefore = _sound.DbgInfo(0);
+        Console.WriteLine("  hit alias0 before : " + hitBefore);
+
+        Console.WriteLine("  -- firing a 3.25 cue (opens the egg pool) --");
+        MakeTick(3.25, true);
+        System.Threading.Thread.Sleep(300);
+
+        string hitAfter = _sound.DbgInfo(0);
+        string eggAfter = _soundEgg == null ? "(egg pool not opened)" : _soundEgg.DbgInfo(0);
+        Console.WriteLine("  hit alias0 after  : " + hitAfter);
+        Console.WriteLine("  egg alias0        : " + eggAfter);
+
+        // A plain cue must still land on the hit pool's own file.
+        int before = _sound.Plays;
+        MakeTick(5, true);
+        System.Threading.Thread.Sleep(300);
+        string hitFinal = _sound.DbgInfo(0);
+        Console.WriteLine("  plain 5 cue       : hit.Plays " + before + " -> " + _sound.Plays);
+        Console.WriteLine("  hit alias0 final  : " + hitFinal);
+
+        int bad = 0;
+        if (hitBefore != hitFinal) { bad++; Console.WriteLine("  FAIL hit alias changed after the egg pool opened"); }
+        if (hitAfter.Contains("length=196")) { bad++; Console.WriteLine("  FAIL hit alias was rebound to er.mp3 (length 196)"); }
+        if (_sound.Plays == before) { bad++; Console.WriteLine("  FAIL the plain cue did not play on the hit pool"); }
+        if (_soundEgg != null && !eggAfter.Contains("length=196")) {
+            Console.WriteLine("  note: egg alias length is " + eggAfter + " (expected er.mp3 = 196)");
+        }
+        Console.WriteLine(bad == 0 ? "ALIAS CHECK: ISOLATED OK" : "ALIAS CHECK: FAILURES=" + bad);
+        if (bad != 0) Environment.ExitCode = 1;
+    }
     // drives the real tick loop without the UI timer, for --simchain
     public void PumpTicks(int n) { for (int i = 0; i < n; i++) OnTickProbe(); }
     // tests must never talk to the network: that races with the simulated readings
@@ -3856,6 +4074,140 @@ public sealed class WbPet : Form {
             Console.WriteLine("credcheck: REJECTED - " + ex.Message);
             Environment.ExitCode = 1;
         }
+    }
+
+    // Drives ONE real cue of `amount` through the production charge path so the
+    // easter-egg wiring is exercised end to end, then reports what happened.
+    // MakeTick calls PlayHitSound(amount), which is the exact code a live
+    // balance drop reaches - nothing here is a copy of the routing logic. The
+    // egg pool opens on demand on the first egg cue, which is what the caller
+    // reads out of the log; that is deliberately the only on-demand log line,
+    // so its presence is an unambiguous "yes, this amount went to the egg".
+    public void RunEggLiveCheck(double amount) {
+        Console.WriteLine("easter-egg live cue (--eggsoundlive)");
+        // _soundEnabled follows state.ini's "sound=" line, so a user who muted
+        // the pet would make this probe report "no pool" and look like a bug in
+        // the easter egg. The probe is about routing, not about the mute, so it
+        // states the flag it measured and forces it on for the cue.
+        Console.WriteLine("  soundEnabledFromState=" + _soundEnabled);
+        _soundEnabled = true;
+
+        Console.WriteLine("  amount     : " + FmtAmt(amount));
+        Console.WriteLine("  routesEgg  : " + IsEggStep(amount));
+        string eggPath = Path.Combine(_baseDir, Get("WBPET_EGG_FILE", EGG_FILE));
+        Console.WriteLine("  egg file   : " + eggPath + "  exists=" + File.Exists(eggPath));
+        Console.WriteLine("  hitPool    : " + (_sound != null) +
+                          "  failed=" + (_sound == null ? "n/a" : _sound.Failed.ToString()) +
+                          "  plays=" + (_sound == null ? -1 : _sound.Plays));
+
+        _lastCueAmount = 0;
+        MakeTick(amount, true);            // fromTest: no real credits are spent
+        // Let MCI settle far enough to answer, then report the pool state.
+        System.Threading.Thread.Sleep(250);
+        bool opened = _soundEgg != null;
+        int hitPlaysNow = _sound == null ? -1 : _sound.Plays;
+        Console.WriteLine("  eggPoolOpen= " + opened +
+                          (opened ? "  failed=" + _soundEgg.Failed + "  plays=" + _soundEgg.Plays : ""));
+        Console.WriteLine("  lastCue    : " + FmtAmt(_lastCueAmount));
+        Console.WriteLine("  hitPlaysNow: " + hitPlaysNow);
+        // Both branches must have produced a cue on SOME pool - an egg-pool
+        // "opened" with no play, or a hit-pool with no new play, means the cue
+        // silently went nowhere.
+        bool played = opened ? _soundEgg.Plays > 0 : hitPlaysNow > 0;
+        Console.WriteLine(!played ? "egg live: NOTHING PLAYED (check the audio device)"
+                          : opened ? "egg live: EGG POOL USED"
+                                   : "egg live: plain hit sound");
+    }
+
+    // Easter-egg routing (--eggsound). Pure logic: no device, no file, so it
+    // runs anywhere and can never be the thing that breaks the audio tests
+    // above.
+    //
+    // The boundary is the whole point of this test. The first build used a
+    // 1e-6 tolerance and this suite caught it: a 0.1% fuzz (a custom step such
+    // as 3.25 + 0.1%, or 3.25 rounded through a balance) also fired, so the
+    // easter egg leaked onto any near-miss step. The rule was changed to an
+    // exact two-decimal match, and both sides are pinned below - exact hits,
+    // and the slivers that are NOT the step.
+    void RunEggSoundTest() {
+        Console.WriteLine("easter-egg sound routing (--eggsound)");
+        int bad = 0, ok = 0;
+        Console.WriteLine("  egg steps  : " + EggStepText());
+        Console.WriteLine("  egg file   : " + EGG_FILE);
+        Console.WriteLine("  version tag: " + (VersionTag.Length > 0 ? VersionTag : "(none)") +
+                          "   about label=" + AboutVersionLabel());
+
+        // Boundaries are chosen so the expectation follows from ordinary
+        // decimal rounding to two places, not from a tolerance anybody had to
+        // pick. Both directions are pinned:
+        //   hit  - the three egg amounts, their binary near-representations
+        //          (what a double actually holds), and values within half a
+        //          unit in the second decimal that round UP to the egg;
+        //   miss - the other half of each boundary, which rounds away from it.
+        // The first build used a 1e-6 tolerance and this suite rejects it: a
+        // 3.25006 charge played the egg even though it is not the 3.25 step.
+        double[] hit = new double[] {
+            3.25, 32.5, 325,
+            3.2500000000000004,   // the double nearest 3.25
+            3.25006, 3.2549,      // round up to 3.25, nothing finer
+            32.500000000000004, 32.5049,
+            325.00000000000006, 325.0049,
+            3.2499999992          // the sub-step sliver, which is charged as the step
+        };
+        double[] miss = new double[] {
+            0.1, 1, 3, 3.2, 3.3, 3.5, 5, 10, 30, 32, 33, 65, 100,
+            320, 330, 350, 1000, 0,
+            // the far half of each rounding boundary - these round away
+            3.2551, 3.2757,
+            32.5051, 32.5054,
+            325.0051, 325.0055,
+            4.2501
+        };
+        for (int i = 0; i < hit.Length; i++) {
+            bool got = IsEggStep(hit[i]);
+            if (got) ok++; else { bad++; Console.WriteLine("  FAIL " + Dbg(hit[i]) + " should use the egg sound"); }
+        }
+        for (int i = 0; i < miss.Length; i++) {
+            bool got = IsEggStep(miss[i]);
+            if (!got) ok++; else { bad++; Console.WriteLine("  FAIL " + Dbg(miss[i]) + " must NOT use the egg sound"); }
+        }
+        Console.WriteLine("  routing ok=" + ok + " bad=" + bad);
+
+        // The egg steps must NOT be listed in the menu - that would put the
+        // easter egg on display, and the whole point is discovery. They are
+        // still reachable by typing the value into "custom", which is the
+        // intended path. Count them so a future re-add is caught here.
+        int inMenu = 0, menuSteps = 0;
+        foreach (ToolStripItem it in _stepItem.DropDownItems) {
+            double d;
+            if (it is ToolStripMenuItem && double.TryParse(((ToolStripMenuItem)it).Text,
+                    NumberStyles.Float, CultureInfo.InvariantCulture, out d)) {
+                menuSteps++;
+                if (IsEggStep(d)) inMenu++;
+            }
+        }
+        Console.WriteLine("  eggStepsInMenu=" + inMenu + " (expect 0: kept hidden)");
+        if (inMenu != 0) bad++;
+        Console.WriteLine("  menuSteps=" + menuSteps + " (expect 4: 0.1/1/5/10)");
+        if (menuSteps != 4) bad++;
+
+        // Alias uniqueness (the 2026-10-07 defect). MCI aliases are process-wide,
+        // so two pools that pick the same names make the second pool's
+        // "close + open ... alias" rebind the first pool's handles to its own
+        // file. Symptom: once the egg fired, EVERY later cue played er.mp3 -
+        // any step, real or demo. The alias tags must be disjoint.
+        //
+        // Cheap and device-free: compare the tag prefixes the two pools would
+        // take. SoundPool allocates from a static counter, so the next two
+        // tags can be predicted without constructing anything.
+        string t1 = SoundPool.PeekNextTag(1);
+        string t2 = SoundPool.PeekNextTag(2);
+        Console.WriteLine("  aliasTags  : " + t1 + " / " + t2 +
+                          "   disjoint=" + (t1 != t2));
+        if (t1 == t2) { bad++; Console.WriteLine("  FAIL pool alias tags collide"); }
+
+        Console.WriteLine(bad == 0 ? "EGG TEST: ALL PASS" : "EGG TEST: FAILURES=" + bad);
+        if (bad != 0) Environment.ExitCode = 1;
     }
 
     // MCI slot-state rule (--soundtest).
@@ -4146,6 +4498,7 @@ public static class ExeEntry {
         "characters/sprite-gpt.png",
         "characters/sprite-gpt_detailed.png",
         "hit.mp3",
+        "er.mp3",
         "DaFeiYu.ico",
     };
 

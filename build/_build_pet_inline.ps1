@@ -21,6 +21,7 @@ try {
       'characters\sprite-gpt.png',
       'characters\sprite-gpt_detailed.png',
       'hit.mp3',
+      'er.mp3',
       'DaFeiYu.ico'
     )
     $buf.Add('dir: ' + $here)

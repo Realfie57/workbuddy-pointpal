@@ -67,7 +67,7 @@ try {
                      -asm (Join-Path $here '_asm_uninstall.cs')
     $ok2 = Build-One -src (Join-Path $here 'setup.cs') `
                      -out (Join-Path $here 'WorkBuddy PointPal Setup.exe') `
-                     -res @($petExe, (Join-Path $here 'Uninstall.exe'), $ico, $bundle, $bundleIco) `
+                     -res @($petExe, (Join-Path $here 'Uninstall.exe'), $ico, $bundle, $bundleIco, (Join-Path $here 'er.mp3')) `
                      -asm (Join-Path $here '_asm_setup.cs')
     if ($ok1 -and $ok2) { $buf.Add('RESULT: OK') } else { $buf.Add('RESULT: COMPILE_FAILED') }
 } catch {

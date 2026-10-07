@@ -37,7 +37,11 @@ using Microsoft.Win32;
 
 public static class PointPalSetup {
     public const string Product   = "WorkBuddy PointPal";
-    public const string Version   = "1.2.16";
+    // Version is what people READ (Apps & features, file names). VersionCore is
+    // the numeric form the assembly metadata and any numeric consumer needs -
+    // "zc" is not a number and would make the assembly unloadable.
+    public const string VersionCore = "1.2.16.1";
+    public const string Version   = "1.2.16.zc";
     public const string Publisher = "Realfie";
     public const string PetExe    = "WorkBuddy PointPal.exe";
     public const string UninstExe = "Uninstall.exe";
@@ -53,6 +57,9 @@ public static class PointPalSetup {
     // shortcut must name one explicitly. We ship a WorkBuddy-branded icon
     // (distinct from the pet's own DaFeiYu.ico) and drop it next to the
     // launcher at install time.
+    // Easter-egg cue (v1.2.16.zc): shipped next to the pet so a machine that
+    // never had it can still play it. ASCII name, addressed by bare name.
+    public const string EggFile       = "er.mp3";
     public const string BundleIcoRes  = "WorkBuddy_fake_icon.ico";
     public const string BundleIcoFile = "WorkBuddy & PointPal.ico";
     // The dual-launcher shortcut MUST target an executable, or Windows will
@@ -547,6 +554,10 @@ public static class PointPalSetup {
             // needs an explicit one. Ship it alongside (always, for the same
             // reason as the launcher itself).
             ExtractResRetry(BundleIcoRes, Path.Combine(dir, BundleIcoFile));
+            // Easter-egg cue. A portable exe unpacks its own copy into the data
+            // folder, but an INSTALLED pet reads the install directory (the
+            // launcher starts it from there), so the file has to be laid down.
+            ExtractResRetry(EggFile, Path.Combine(dir, EggFile));
 
             string deskDir = Environment.GetFolderPath(machine
                 ? Environment.SpecialFolder.CommonDesktopDirectory
