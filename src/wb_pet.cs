@@ -842,7 +842,7 @@ public sealed class WbPet : Form {
     // in step with _asm_pet.cs (assembly 4th segment) and setup.cs
     // (VersionSuffix). Deliberately NOT part of the assembly version: a
     // non-numeric segment would refuse to load.
-    const string VersionTag = "zc";
+    const string VersionTag = "";
         const string S_SOUNDMENU="\u53D7\u51FB\u97F3\u6548";                         // hit sound toggle
     const string S_ABOUT   = "\u5173\u4E8E...";                                  // about...
     const string S_ABOUTT  = "\u5173\u4E8E";                                     // about (title)
