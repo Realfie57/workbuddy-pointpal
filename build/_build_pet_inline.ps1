@@ -34,7 +34,9 @@ try {
     $cp.IncludeDebugInformation = $false
     $cp.OutputAssembly = $out
     $cp.CompilerOptions = "/optimize+ /target:winexe /win32icon:$ico"
-    foreach ($a in @('System.dll','System.Core.dll','System.Drawing.dll','System.Windows.Forms.dll','System.Net.Http.dll')) {
+    # System.Security.dll is required by ProtectedData (DPAPI), which seals
+    # token.txt under the current user since 1.2.18.
+    foreach ($a in @('System.dll','System.Core.dll','System.Drawing.dll','System.Windows.Forms.dll','System.Net.Http.dll','System.Security.dll')) {
         [void]$cp.ReferencedAssemblies.Add($a)
     }
     foreach ($r in $res) { [void]$cp.EmbeddedResources.Add((Join-Path $here $r)) }

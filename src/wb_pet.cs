@@ -913,7 +913,8 @@ public sealed class WbPet : Form {
         "--selftest", "--shot", "--credtest", "--credcheck",
         "--soundtest", "--soundprobe", "--soundsoak", "--soundab", "--simchain",
         "--abouttest", "--aboutsheet", "--toksheet", "--updtest", "--updsheet",
-        "--updnet", "--updfound", "--eggsound", "--eggsoundlive", "--aliascheck"
+        "--updnet", "--updfound", "--eggsound", "--eggsoundlive", "--aliascheck",
+        "--wbtest", "--cryptest"
     };
     public static bool IsTestMode(string[] args) {
         foreach (string a in args)
@@ -1097,9 +1098,6 @@ public sealed class WbPet : Form {
         // First run: nothing configured a token, so ask once instead of leaving
         // the tablet stuck on "--". Cancelling keeps it offline.
         bool quietRun = WbPet.IsTestMode(args);
-        if (string.IsNullOrEmpty(_token) && !quietRun) {
-            TryAutoDetectToken();
-        }
         if (string.IsNullOrEmpty(_token) && !quietRun && !File.Exists(TokenPath)) {
             // Same window as the tray menu's "set credential": a first-time
             // user should not meet a bare one-line box with no explanation.
@@ -1143,31 +1141,18 @@ public sealed class WbPet : Form {
         return string.IsNullOrEmpty(v) ? f : v;
     }
 
-    // Best-effort credential discovery. WorkBuddy keeps its own login state
-    // encrypted / in-process, so there is nothing reliable to reuse on disk;
-    // this only scans a couple of well-known spots for a JWT-looking string
-    // and logs the outcome. Manual paste (menu) is the supported path.
-    void TryAutoDetectToken() {
-        try {
-            string home = Environment.GetEnvironmentVariable("USERPROFILE");
-            string[] candidates = new string[] {
-                Path.Combine(home, ".workbuddy", "token.txt"),
-                Path.Combine(home, ".workbuddy", "credentials.txt")
-            };
-            foreach (string c in candidates) {
-                if (!File.Exists(c)) continue;
-                string t = File.ReadAllText(c).Trim();
-                if (t.Length > 10) {
-                    SetToken(t);
-                    Log("auto-detect: token loaded from " + c);
-                    return;
-                }
-            }
-            Log("auto-detect: no reusable local credential found (expected); use the menu to paste one");
-        } catch (Exception ex) {
-            Log("auto-detect failed: " + ex.Message);
-        }
-    }
+    // NOTE (1.2.18): a TryAutoDetectToken() used to sit here. It read
+    // %USERPROFILE%\.workbuddy\token.txt and credentials.txt - the WorkBuddy
+    // client's OWN data folder - and adopted whatever it found as the login
+    // credential. It is gone for two reasons:
+    //   1. It never worked. WorkBuddy keeps its session encrypted / in-process
+    //      and neither file exists (verified on the dev machine 2026-10-12),
+    //      so all it ever produced was a "no credential found" log line.
+    //   2. It was the most malware-looking code in this file: an unsigned
+    //      third-party app probing another application's config directory for
+    //      a token. Two string literals are enough for a static scanner to
+    //      draw the obvious conclusion.
+    // Pasting the cURL into the credential dialog is the ONLY supported path.
 
     // Accepts a whole "Copy as cURL" command (recommended), a bare Cookie
     // value, "token", "Bearer token", or "uid:<credential>".
@@ -1818,6 +1803,8 @@ public sealed class WbPet : Form {
         sb.Append("\u4F5C\u8005\uFF1ARealfie\r\n");                                                      // author
         sb.Append("\u7F16\u6392\uFF1A\u57FA\u4E8E\u5F00\u6E90\u9879\u76EE DSH \u4F59\u989D\u684C\u5BA0");
         sb.Append("\u6539\u7F16\r\n\r\n");                                                               // adapted from the DSH pet
+        sb.Append("\u672C\u7A0B\u5E8F\u662F\u975E\u5B98\u65B9\u7684\u7B2C\u4E09\u65B9\u5C0F\u5DE5\u5177");
+        sb.Append("\uFF0C\u4E0E WorkBuddy \u5B98\u65B9\u65E0\u5173\uFF0C\u4E5F\u672A\u83B7\u5B98\u65B9\u6388\u6743\u3002\r\n\r\n");  // unofficial third-party tool
         sb.Append("\u6570\u636E\u76EE\u5F55\uFF1A\r\n").Append(_baseDir).Append("\r\n\r\n");              // data folder
         sb.Append("\u8FD0\u884C\u65B9\u5F0F\uFF1A\u4EE5\u4F60\u7684\u8EAB\u4EFD\u672C\u5730\u8FD0\u884C");
         sb.Append("\uFF0C\u4E0D\u4F1A\u4E0A\u4F20\u4EFB\u4F55\u6570\u636E\uFF1B\r\n");                     // runs locally as you, uploads nothing
@@ -2376,11 +2363,19 @@ public sealed class WbPet : Form {
             return;
         }
         try {
-            // BOM on purpose: the PowerShell launcher reads this back with
-            // Get-Content, which assumes ANSI unless a BOM says UTF-8.
-            // line1 = credential, line2 = uid (optional), line3 = User-Agent.
+            // line1 = credential, line2 = uid (optional), line3 = User-Agent,
+            // sealed with DPAPI under the CURRENT USER before it touches disk.
+            // The plaintext used to be written verbatim, so a copied, backed-up
+            // or mis-sent data folder handed over a live session. The DPAPI key
+            // is derived from the user's logon credentials and never stored on
+            // disk, so the bytes are useless off this machine / this account.
+            //
+            // It is NOT protection against code already running as this user:
+            // such code can call the very same decrypt API. See PRIVACY.md.
             string body = _token + "\r\n" + _uid + "\r\n" + _ua;
-            File.WriteAllText(TokenPath, body, new UTF8Encoding(true));
+            byte[] plain  = new UTF8Encoding(false).GetBytes(body);
+            byte[] sealed_ = ProtectedData.Protect(plain, null, DataProtectionScope.CurrentUser);
+            File.WriteAllBytes(TokenPath, sealed_);
         } catch { }
     }
 
@@ -3055,7 +3050,7 @@ public sealed class WbPet : Form {
     string FetchWithNode() {
         string node = FindNode();
         if (node == null) throw new Exception("node not found");
-        // ---- why this script reads argv and not process.env --------------
+        // ---- why this script reads stdin, not argv or process.env --------
         // The credentials used to travel as environment variables, which meant
         // building a ProcessStartInfo environment. That is impossible on this
         // machine: the OS block carries BOTH spellings of several names
@@ -3068,12 +3063,19 @@ public sealed class WbPet : Form {
         // itself is fine with the duplicated block; only the .NET side chokes.
         //
         // So: leave the child's environment entirely alone (it inherits the raw
-        // block and Node copes) and pass the request parameters as argv. Node's
-        // require('https') ignores *_PROXY anyway, so the inherited proxies are
-        // harmless for this direct call.
+        // block and Node copes) and hand the request parameters over on STDIN.
+        // NOT argv: the command line of a process is readable by anything
+        // running as this user (task manager, WMI, Process Explorer), so a
+        // credential placed there is effectively published machine-wide.
+        // Node's require('https') ignores *_PROXY anyway, so the inherited
+        // proxies are harmless for this direct call.
         string script =
             "const h=require('https');" +
-            "let c={};try{c=JSON.parse(process.argv[1]||'{}')}catch(e){console.error('bad argv');process.exit(6)}" +
+            "let raw='';" +
+            "process.stdin.on('data',d=>{raw+=d});" +
+            "process.stdin.on('end',()=>{go(raw)});" +
+            "function go(raw){" +
+            "let c={};try{c=JSON.parse(raw||'{}')}catch(e){console.error('bad stdin');process.exit(6)}" +
             "const u=new URL(c.url);" +
             "const hdr={'Content-Type':'application/json',Accept:'application/json','Accept-Language':'zh'};" +
             // Guard the missing-key case: the unguarded form built 'Bearer
@@ -3091,10 +3093,11 @@ public sealed class WbPet : Form {
             "process.stdout.write(b)})});" +
             "r.on('error',e=>{console.error(String(e.message||e));process.exit(2)});" +
             "r.setTimeout(15000,()=>{console.error('timeout');process.exit(3)});" +
-            "r.write('{}');r.end();";
+            "r.write('{}');r.end();}";
 
-        // The payload rides as a single argv token, JSON-encoded so no quoting
-        // or Chinese-character surprises can leak into the command line.
+        // The payload is JSON-encoded and written to the child's stdin, so no
+        // quoting rules apply and no Chinese-character surprise can end up on
+        // the command line, where other processes could read it.
         string payload = "{"
             + "\"url\":"  + JsonStr(_apiUrl)
             + ",\"key\":" + JsonStr(_token)
@@ -3105,15 +3108,21 @@ public sealed class WbPet : Form {
 
         ProcessStartInfo psi = new ProcessStartInfo();
         psi.FileName = node;
-        psi.Arguments = "-e \"" + script.Replace("\"", "\\\"") + "\" \"" + payload.Replace("\"", "\\\"") + "\"";
+        // Only the script rides on the command line; the payload goes to stdin
+        // (below). The command line must never carry the credential again.
+        psi.Arguments = "-e \"" + script.Replace("\"", "\\\"") + "\"";
         psi.UseShellExecute = false;
         psi.CreateNoWindow = true;
+        psi.RedirectStandardInput = true;
         psi.RedirectStandardOutput = true;
         psi.RedirectStandardError = true;
         // NOTE: deliberately NOT touching psi.Environment / psi.EnvironmentVariables
         // here (see the comment above).
 
         using (Process p = Process.Start(psi)) {
+            // Hand the payload over and close the pipe so node's 'end' fires.
+            p.StandardInput.Write(payload);
+            p.StandardInput.Close();
             string outp = p.StandardOutput.ReadToEnd();
             string errp = p.StandardError.ReadToEnd();
             if (!p.WaitForExit(20000)) { try { p.Kill(); } catch { } throw new Exception("node timeout"); }
@@ -3451,6 +3460,15 @@ public sealed class WbPet : Form {
 
         // Real end-to-end credential check (--credcheck <file>): parse a pasted
         // cURL with the app's own parser and POST it to the real gateway.
+        // --cryptest: round-trip the DPAPI credential store using a temp file
+        // only. Proves (a) the sealed bytes carry no plaintext, (b) they read
+        // back byte-identical, and (c) a 1.2.17-style plain-text file still
+        // loads - the upgrade path must not log anyone out.
+        if (Array.IndexOf(args, "--cryptest") >= 0) {
+            ExeEntry.RunCryptTest();
+            return;
+        }
+
         int credIdx = Array.IndexOf(args, "--credcheck");
         if (credIdx >= 0) {
             pet.GoOffline();                 // stop the background poll, keep the net open
@@ -4726,6 +4744,19 @@ public static class ExeEntry {
         // (or steal the slot from) the user's real pet.
         bool isTestMode = WbPet.IsTestMode(args);
         bool wantWb = WantsWorkBuddy(args);
+
+        // --wbtest: report which WorkBuddy the dual launcher would start, then
+        // exit WITHOUT starting anything. Launching it for real is exactly the
+        // side effect a test must not have, so the search logic gets a mode of
+        // its own; stdout is captured via _tools/_run_capture.ps1 (winexe).
+        if (Array.IndexOf(args, "--wbtest") >= 0) {
+            Console.WriteLine("wbtest: override     -> " + (WbFromOverride() ?? "(none)"));
+            Console.WriteLine("wbtest: start menu   -> " + (WbFromStartMenu() ?? "(none)"));
+            Console.WriteLine("wbtest: drives       -> " + (WbFromDrives() ?? "(none)"));
+            Console.WriteLine("wbtest: resolved     -> " + (FindWorkBuddy() ?? "(not found)"));
+            return;
+        }
+
         SingleInstance guard = null;
         if (!isTestMode) {
             guard = new SingleInstance();
@@ -4908,12 +4939,86 @@ public static class ExeEntry {
         return line;
     }
 
+    // --cryptest: proves the 1.2.18 credential store round-trips and that a
+    // 1.2.17-style plain-text file still loads. A temp file is used throughout
+    // - the live token.txt is never touched.
+    public static void RunCryptTest() {
+        Console.WriteLine("credential store round-trip (--cryptest)");
+        int nOk = 0, nBad = 0;
+        string tmp = Path.Combine(Path.GetTempPath(),
+                                  "wbpet_crypt_" + Guid.NewGuid().ToString("N") + ".txt");
+        string body = "COOKIEVALUE=abc; session=xyz\r\nuid-1234\r\n" + new string('U', 125);
+        try {
+            byte[] sealed_ = ProtectedData.Protect(new UTF8Encoding(false).GetBytes(body),
+                                                   null, DataProtectionScope.CurrentUser);
+            File.WriteAllBytes(tmp, sealed_);
+
+            bool noPlain = !BytesContain(File.ReadAllBytes(tmp), "COOKIEVALUE");
+            Console.WriteLine((noPlain ? "  PASS  " : "  FAIL  ") + "sealed file contains no plaintext");
+            if (noPlain) nOk++; else nBad++;
+
+            string[] lines = ReadCredentialLines(tmp);
+            bool rt = lines != null && lines.Length >= 2 &&
+                      lines[0] == "COOKIEVALUE=abc; session=xyz" && lines[1] == "uid-1234";
+            Console.WriteLine((rt ? "  PASS  " : "  FAIL  ") + "sealed file reads back identically");
+            if (rt) nOk++; else nBad++;
+
+            // Exactly what 1.2.17 wrote: plain text, three lines, UTF-8 with BOM.
+            File.WriteAllText(tmp, body, new UTF8Encoding(true));
+            string[] legacy = ReadCredentialLines(tmp);
+            bool lOk = legacy != null && legacy.Length >= 3 &&
+                       legacy[0] == "COOKIEVALUE=abc; session=xyz" && legacy[1] == "uid-1234";
+            Console.WriteLine((lOk ? "  PASS  " : "  FAIL  ") + "legacy plain-text file still loads");
+            if (lOk) nOk++; else nBad++;
+        } catch (Exception ex) {
+            Console.WriteLine("  FAIL  exception: " + ex.Message);
+            nBad++;
+        } finally {
+            try { if (File.Exists(tmp)) File.Delete(tmp); } catch { }
+        }
+        Console.WriteLine("cryptest: " + nOk + " passed, " + nBad + " failed");
+    }
+
+    // Plain substring test over raw bytes - used above to prove a sealed file
+    // does not carry the credential in the clear.
+    static bool BytesContain(byte[] hay, string needle) {
+        byte[] n = Encoding.ASCII.GetBytes(needle);
+        if (n.Length == 0 || hay.Length < n.Length) return false;
+        for (int i = 0; i + n.Length <= hay.Length; i++) {
+            bool all = true;
+            for (int j = 0; j < n.Length; j++) {
+                if (hay[i + j] != n[j]) { all = false; break; }
+            }
+            if (all) return true;
+        }
+        return false;
+    }
+
+    // token.txt is DPAPI-sealed as of 1.2.18. Files written by 1.2.17 and
+    // earlier are plain text (with a BOM), so try the seal first and fall back
+    // to the legacy shape - an upgrade must never log the user out.
+    static string[] ReadCredentialLines(string tf) {
+        try {
+            byte[] rawBytes = File.ReadAllBytes(tf);
+            if (rawBytes.Length == 0) return null;
+            try {
+                byte[] plain = ProtectedData.Unprotect(rawBytes, null, DataProtectionScope.CurrentUser);
+                return new UTF8Encoding(false).GetString(plain).Replace("\r\n", "\n").Split('\n');
+            } catch {
+                // Not a DPAPI blob - a legacy plain-text file. Fall through.
+            }
+            // Encoding.UTF8 is BOM-aware, matching the old loader exactly.
+            return File.ReadAllLines(tf, Encoding.UTF8);
+        } catch { return null; }
+    }
+
     static void BootCredentials(string baseDir) {
         try {
             if (Environment.GetEnvironmentVariable("WBPET_TOKEN") != null) return;
             string tf = Path.Combine(baseDir, "token.txt");
             if (!File.Exists(tf)) return;
-            string[] lines = File.ReadAllLines(tf, Encoding.UTF8);   // BOM-safe
+            string[] lines = ReadCredentialLines(tf);
+            if (lines == null) return;
             for (int i = 0; i < lines.Length; i++) lines[i] = StripCredLabel(lines[i].Trim());
             if (lines.Length >= 1 && lines[0].Length > 0)
                 Environment.SetEnvironmentVariable("WBPET_TOKEN", lines[0]);
