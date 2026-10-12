@@ -40,16 +40,17 @@ Windows 10 / 11 · 免安装 · 无需 Node / .NET SDK · 不联网也能跑（�
 
 几个细节：
 
-- **先桌宠、后 WorkBuddy**：桌宠先起来（它要读凭证、开始轮询余额），随即拉起 WorkBuddy；
-- **桌宠不会开出第二只**：启动前会先查进程表，桌宠已经在跑就跳过，只补上 WorkBuddy；
-- **WorkBuddy 装在哪个盘都找得到**。WorkBuddy 本体没有卸载项、也没有注册表路径键，所以它只能靠这三条线索找：
-  1. **`wb-path.txt`** —— 脚本旁边放这个文件，里面写一行 `WorkBuddy.exe` 的完整路径。这是**手动兜底**，任何自动方式都搞不定的机器靠它。文件不存在就自动跳过；
+- **先桌宠、后 WorkBuddy**：桌宠先起来（它要读凭证、开始轮询余额），约 1 秒后再拉起 WorkBuddy；
+- **桌宠不会开出第二只**：第二次启动会走单实例逻辑，桌宠已经在跑就跳过，只补上 WorkBuddy；
+- **没有脚本**：快捷方式直接指向 `WorkBuddy PointPal.exe`，只多带一个 `--launch-wb` 参数，定位逻辑写在 `wb_pet.cs` 里。（早期版本用一个 `.vbs` 实现，被 360 判成木马释放器，已彻底移除。）
+- **WorkBuddy 装在哪个盘都找得到**。WorkBuddy 本体没有卸载项、也没有注册表路径键，所以它只能靠这几条线索找：
+  1. **`wb-path.txt`** —— 放在数据目录或 exe 同目录，里面写一行 `WorkBuddy.exe` 的完整路径。这是**手动兜底**，任何自动方式都搞不定的机器靠它。文件不存在就自动跳过；
   2. **开始菜单快捷方式** —— 递归扫描当前用户和所有用户的开始菜单，读快捷方式指向的真实路径。这是**最可靠的一条**，因为你装到哪个盘它就跟着到哪个盘；
   3. **全盘扫描** —— 遍历所有就绪的本地磁盘和移动盘，查 `Program Files\WorkBuddy` 等常见位置。
-  三层都落空时，最后还会试几个固定路径兜底；如果**全部失败**，它会**弹出提示框**告诉你怎么用 `wb-path.txt` 手动指定，而不是默默什么都不做；
-- **专属图标**：快捷方式用的是 `WorkBuddy_fake_icon.ico`（照着 WorkBuddy 风格自己做的），所以它能正常固定到任务栏。
+  全部落空时，最后还会试几个固定路径兜底；如果**都失败**，它会**弹出提示框**告诉你怎么用 `wb-path.txt` 手动指定，而不是默默什么都不做；
+- **专属图标**：快捷方式用的是 `WorkBuddy & PointPal.ico`（照着 WorkBuddy 风格自己做的）；目标本身是 exe，所以它能正常固定到任务栏。
 
-> 想单独启动桌宠、不要 WorkBuddy，双击安装目录里的「**启动 WorkBuddy PointPal.vbs**」即可。
+> 想单独启动桌宠、不要 WorkBuddy：别用那个双启动快捷方式，点普通的「WorkBuddy PointPal」快捷方式即可。
 
 ---
 
@@ -161,8 +162,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File _build_setup_inline.ps1
 │   ├── uninstall.cs           卸载程序
 │   ├── _asm_pet.cs            程序集元数据（FileVersion / Product / Publisher）
 │   ├── _asm_setup.cs
-│   ├── _asm_uninstall.cs
-│   └── wb_pet.ps1             PowerShell 版启动器（编译加载 wb_pet.cs 后运行）
+│   └── _asm_uninstall.cs
 ├── build/                     构建脚本
 │   ├── _build_pet_inline.ps1
 │   ├── _build_setup_inline.ps1
@@ -174,17 +174,18 @@ powershell -NoProfile -ExecutionPolicy Bypass -File _build_setup_inline.ps1
 ├── er.mp3                     彩蛋音效（扣费步长 3.25 / 32.5 / 325 时替换 hit.mp3）
 ├── characters/                可选角色（Claude / Gemini / GPT / DSH）
 ├── DaFeiYu.ico                应用图标（exe / 托盘 / 输入框）
-├── WorkBuddy_fake_icon.ico    双启动器快捷方式专属图标
-├── _payload_bundle_launcher.vbs  「WorkBuddy & PointPal」双启动器载荷（UTF-16LE+BOM）
-├── 启动 WorkBuddy PointPal.vbs  脚本版启动器（静默无黑框）
-├── 启动（调试窗口）.cmd        出问题时用，能看到报错
+├── WbLauncher.ico             「WorkBuddy & PointPal」快捷方式专属图标
 ├── 先看这里（快速开始）.md     给收件人看的简版说明
 └── docs/说明文档.md            完整文档（原理 / 排错 / 改图改音效 / 自检命令）
 ```
 
 源码里 `setup.cs` / `uninstall.cs` 是**原始 UTF-8 中文**（编译带 `/codepage:65001`），
-`wb_pet.cs` 是 **`\uXXXX` 转义**——这是刻意为之：PowerShell 5.1 读无 BOM 的 `.ps1` 会按 ANSI 解析，
-所以 UI 文案全部转义存放，中文在任何代码页下都不会乱码。
+`wb_pet.cs` 是 **`\uXXXX` 转义**——这是刻意为之（早期还有一条按 ANSI 读源码的 PowerShell
+启动路径），所以 UI 文案全部转义存放，中文在任何代码页下都不会乱码。
+
+> **本仓库不含任何脚本**（`.vbs` / `.cmd` / `.ps1` 都没有）。早期版本附带过 `.vbs` 启动器，
+> 被 360 当成木马释放器查杀（`virus.vbs.powershell.a` / `virus.vbs.dropper.d`），现已彻底移除。
+> 构建用的 PowerShell 脚本放在 `build/`，仅供开发者本地编译，不随发布物分发。
 
 ---
 

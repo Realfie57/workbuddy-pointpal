@@ -41,10 +41,15 @@ using Microsoft.Win32;
 public static class PointPalUninstall {
     const string Product = "WorkBuddy PointPal";
     // The dual launcher installed alongside the pet: a desktop shortcut of
-    // this name (only when the option was ticked) plus a spare .vbs and its
-    // icon in the install folder (always). Kept in sync with setup.cs by hand
-    // because the two exes are compiled separately.
+    // this name (only when the option was ticked) plus its icon in the install
+    // folder. Kept in sync with setup.cs by hand because the two exes are
+    // compiled separately.
     const string BundleLnkName = "WorkBuddy & PointPal";
+    // HISTORICAL name. Builds up to 1.2.16.zc dropped this .vbs next to the pet,
+    // and 360 kept quarantining it (virus.vbs.powershell.a / virus.vbs.dropper.d).
+    // Current builds run the same logic inside the pet exe, but an uninstall -
+    // and an upgrade - must still sweep the old file off machines that came
+    // from one of those builds.
     const string BundleFile    = "WorkBuddy & PointPal.vbs";
     const string BundleIcoFile = "WorkBuddy & PointPal.ico";
     const string RunKeyPath    = @"Software\Microsoft\Windows\CurrentVersion\Run";
@@ -269,8 +274,9 @@ public static class PointPalUninstall {
             if (!string.IsNullOrEmpty(userLoc) && Directory.Exists(userLoc)) {
                 string self = Application.ExecutablePath;
                 TryDelete(Path.Combine(userLoc, "WorkBuddy PointPal.exe"));
-                // Spare dual launcher + its icon: ours, and ours alone, so a
-                // "delete the folder" uninstall must not leave them behind.
+                // Legacy .vbs (see the BundleFile note) plus the launcher icon:
+                // both are ours, and ours alone, so a "delete the folder"
+                // uninstall must not leave them behind.
                 TryDelete(Path.Combine(userLoc, BundleFile));
                 TryDelete(Path.Combine(userLoc, BundleIcoFile));
                 if (SameDir(self, Path.Combine(userLoc, "Uninstall.exe"))) {

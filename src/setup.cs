@@ -45,31 +45,21 @@ public static class PointPalSetup {
     public const string Publisher = "Realfie";
     public const string PetExe    = "WorkBuddy PointPal.exe";
     public const string UninstExe = "Uninstall.exe";
-    // The dual launcher ("WorkBuddy & PointPal") is always copied next to the
-    // pet as a spare; the option below only decides whether it ALSO gets a
-    // desktop shortcut. The payload's resource name is deliberately ASCII while
-    // the on-disk names carry the real ampersand, so no codepage games are
-    // needed to look it up inside the exe.
-    public const string BundleRes     = "_payload_bundle_launcher.vbs";
-    public const string BundleFile    = "WorkBuddy & PointPal.vbs";
+    // The dual launcher ("WorkBuddy & PointPal") no longer ships a script. It
+    // used to be a .vbs dropped beside the pet, and 360 quarantined it twice
+    // (virus.vbs.powershell.a / virus.vbs.dropper.d), which cost us users. The
+    // shortcut now targets the PET EXE itself with the --launch-wb switch; the
+    // locating logic lives in wb_pet.cs (ExeEntry.LaunchWorkBuddy).
     public const string BundleLnkName = "WorkBuddy & PointPal";
-    // The launcher is a .vbs, which cannot carry an icon of its own, so the
-    // shortcut must name one explicitly. We ship a WorkBuddy-branded icon
-    // (distinct from the pet's own DaFeiYu.ico) and drop it next to the
-    // launcher at install time.
-    public const string BundleIcoRes  = "WorkBuddy_fake_icon.ico";
+    public const string BundleSwitch  = "--launch-wb";
+    // One file still travels: the shortcut wants WorkBuddy-flavoured art rather
+    // than the pet's own face. Resource name is ASCII on purpose; the on-disk
+    // name carries the real ampersand.
+    public const string BundleIcoRes  = "WbLauncher.ico";
     public const string BundleIcoFile = "WorkBuddy & PointPal.ico";
-    // The dual-launcher shortcut MUST target an executable, or Windows will
-    // not offer "Pin to taskbar" for it. wscript.exe is the script host that
-    // runs our .vbs; the .vbs path travels as its argument instead.
-    // Resolved from the real System32 at run time (a hardcoded C:\Windows
-    // would break on a Windows installed elsewhere).
-    public static string WscriptExe {
-        get {
-            string sys = Environment.GetFolderPath(Environment.SpecialFolder.System);
-            return Path.Combine(sys, "wscript.exe");
-        }
-    }
+    // The .vbs that builds up to 1.2.16.zc laid down here. We only ever DELETE
+    // it (on install and on uninstall) - it is never shipped again.
+    public const string BundleLegacyVbs = "WorkBuddy & PointPal.vbs";
     public const string RunKeyPath    = @"Software\Microsoft\Windows\CurrentVersion\Run";
     public const string UninstKeyPath = @"Software\Microsoft\Windows\CurrentVersion\Uninstall\WorkBuddyPointPal";
 
@@ -485,15 +475,13 @@ public static class PointPalSetup {
         return s == null ? null : s.Replace("&", "&&");
     }
 
-    // Actual on-disk footprint of the install folder: the embedded payloads
-    // we extract (pet exe + uninstaller + dual launcher). Shown in the folder
+    // Actual on-disk footprint of the install folder: the embedded payloads we
+    // extract (pet exe + uninstaller + the shortcut icon). Shown in the folder
     // page hint. Resolved through the same bare-name matcher ExtractRes uses,
-    // because the resource is recorded as "_payload_bundle_launcher.vbs" while
-    // the const carries that exact name - a direct lookup would work, but the
-    // matcher keeps this honest if the file is ever moved into a subfolder.
+    // so the accounting stays honest if a resource ever moves into a subfolder.
     public static string RequiredSpaceText() {
         long bytes = 0;
-        foreach (string name in new string[] { PetExe, UninstExe, BundleRes, BundleIcoRes }) {
+        foreach (string name in new string[] { PetExe, UninstExe, BundleIcoRes }) {
             try {
                 using (Stream s = OpenBareResource(name)) {
                     if (s != null) bytes += s.Length;
@@ -542,15 +530,14 @@ public static class PointPalSetup {
             Directory.CreateDirectory(dir);
             ExtractResRetry(PetExe, Path.Combine(dir, PetExe));
             ExtractResRetry(UninstExe, Path.Combine(dir, UninstExe));
-            // Spare copy of the dual launcher, ALWAYS created - ticked or not.
-            // Sitting next to the pet it resolves it through the registry just
-            // as reliably as the shortcut's explicit %1, so it is a real
-            // fallback rather than decoration.
-            ExtractResRetry(BundleRes, Path.Combine(dir, BundleFile));
-            // The launcher is a .vbs and cannot carry an icon, so its shortcut
-            // needs an explicit one. Ship it alongside (always, for the same
-            // reason as the launcher itself).
+            // Only the shortcut icon still ships as a file: the launcher logic
+            // lives in the pet exe now (see the BundleLnkName note at the top),
+            // so there is no script payload to drop here any more.
             ExtractResRetry(BundleIcoRes, Path.Combine(dir, BundleIcoFile));
+            // Upgrades from <= 1.2.16.zc find the old .vbs already sitting in
+            // here. Sweep it: leaving it behind is what keeps 360 calling the
+            // whole install folder a dropper.
+            try { File.Delete(Path.Combine(dir, BundleLegacyVbs)); } catch { }
             // NOTE: er.mp3 is deliberately NOT laid down here. The pet reads
             // every asset from its DATA folder (%LOCALAPPDATA%\WorkBuddy
             // PointPal\), which it unpacks from its own embedded copy on each
@@ -587,26 +574,25 @@ public static class PointPalSetup {
             }
 
             // "WorkBuddy & PointPal": pet + WorkBuddy in one double-click.
-            // The shortcut drives the spare copy in the install folder and
-            // hands it that folder as an explicit argument, so it can never
-            // drift onto a stale or second-hand copy of the pet.
             //
-            // IMPORTANT: the target must be wscript.exe, NOT the .vbs itself.
-            // Windows only lets you pin a shortcut whose target is an
-            // executable; point it straight at a script and the taskbar greys
-            // out "Pin to taskbar" and shows a denied cursor on drag. Shipping
-            // the script path as an ARGUMENT keeps the same behaviour while
-            // restoring pinnability (this matches the launcher the user pinned
-            // before the feature moved into the installer).
+            // The target is the pet exe with --launch-wb. That one argument is
+            // now the entire difference from the ordinary shortcut, because the
+            // locating logic moved into wb_pet.cs - nothing needs shipping as a
+            // script any more. Targeting an .exe is also what keeps "Pin to
+            // taskbar" available; the old .vbs build had to aim at wscript.exe
+            // to work around that limit.
             if (bundle) {
                 Report(progress, 62, Mn("正在创建「" + BundleLnkName + "」快捷方式…"));
-                string launcher = Path.Combine(dir, BundleFile);
                 // Icon from the shipped .ico, not the pet exe: the launcher is
                 // WorkBuddy-flavoured and should not look like the pet itself.
                 CreateShortcut(Path.Combine(deskDir, BundleLnkName + ".lnk"),
-                               WscriptExe, dir, Path.Combine(dir, BundleIcoFile) + ",0",
+                               exe, dir, Path.Combine(dir, BundleIcoFile) + ",0",
                                "同时启动 WorkBuddy 与桌宠",
-                               "\"" + launcher + "\" \"" + dir + "\"");
+                               BundleSwitch);
+            } else {
+                // A shortcut from an older build drives wscript.exe against the
+                // .vbs we just deleted, so it can only ever fail now. Drop it.
+                try { File.Delete(Path.Combine(deskDir, BundleLnkName + ".lnk")); } catch { }
             }
 
             Report(progress, 70, "正在写入注册表…");
@@ -913,7 +899,7 @@ public class WizardForm : Form {
         _cbBundle = MkCheck(PointPalSetup.Mn("在桌面创建「" + PointPalSetup.BundleLnkName + "」快捷方式"),
                             28, 204, PointPalSetup.OptBundle);
         p.Controls.Add(_cbBundle);
-        p.Controls.Add(MkLabel("一次双击同时启动 WorkBuddy 与桌宠；该启动器无论是否勾选，都会在安装目录留一份备用。",
+        p.Controls.Add(MkLabel("一次双击同时启动 WorkBuddy 与桌宠。",
                                new Font("Segoe UI", 8.5F), Color.DimGray, 48, 228, 440, 34));
     }
 

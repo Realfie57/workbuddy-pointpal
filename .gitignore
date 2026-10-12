@@ -4,6 +4,13 @@ state.ini
 pet.log
 error.log
 
+# ---- 脚本启动器：绝不再入库（防复发闸门，别删）----
+# 2026-10：.vbs 启动器被 360 判毒（virus.vbs.powershell.a / virus.vbs.dropper.d），
+# 导致用户机器上整个安装目录进隔离区。脚本启动路径已永久下线，
+# 双启动器改为「pet.exe + --launch-wb」。详见 _docs/360报毒误报分析.md。
+*.vbs
+*.cmd
+
 # ---- 构建产物 ----
 *.exe
 *.zip

@@ -4502,12 +4502,230 @@ public static class ExeEntry {
         "DaFeiYu.ico",
     };
 
+    // ------------------------------------------------------ dual launcher ---
+    //
+    // "WorkBuddy & PointPal" (one click starts the pet AND WorkBuddy) used to be
+    // a .vbs that the installer dropped beside the pet. Shipping a script turned
+    // out to be a liability in itself: 360 quarantined both of ours
+    // (virus.vbs.powershell.a and virus.vbs.dropper.d) and told users the app was
+    // a dropper. The shortcut now targets THIS exe with --launch-wb, so the
+    // locating logic lives in the binary users already run, and no .vbs ships.
+    //
+    // Side benefit: the taskbar only pins .exe targets. The old shortcut had to
+    // aim at wscript.exe as a workaround; this one is pinnable directly.
+    public const string LaunchWbSwitch = "--launch-wb";
+
+    public static bool WantsWorkBuddy(string[] args) {
+        foreach (string a in args)
+            if (string.Equals(a, LaunchWbSwitch, StringComparison.OrdinalIgnoreCase)) return true;
+        return false;
+    }
+
+    // Runs on a worker thread with a short delay so the pet paints first:
+    // WorkBuddy arriving a second later is what a "start both" press implies.
+    public static void LaunchWorkBuddy() {
+        ThreadPool.QueueUserWorkItem(delegate {
+            try { Thread.Sleep(1200); } catch { }
+            try { StartWorkBuddy(); } catch { }
+        });
+    }
+
+    static void StartWorkBuddy() {
+        string wb = FindWorkBuddy();
+        if (wb != null) {
+            try {
+                ProcessStartInfo psi = new ProcessStartInfo(wb);
+                psi.UseShellExecute = true;
+                psi.WorkingDirectory = Path.GetDirectoryName(wb);
+                Process.Start(psi);
+                return;
+            } catch { }
+        }
+        // Same remedies the retired launcher listed, minus the file it can no
+        // longer point at: a Start menu shortcut is the clue we look for.
+        MessageBox.Show(
+            "\u6CA1\u80FD\u81EA\u52A8\u627E\u5230 WorkBuddy\uFF0C\u8BF7\u624B\u52A8\u542F\u52A8\u5B83\u3002" + "\r\n\r\n" +
+            "\u60F3\u8BA9\u5B83\u4EE5\u540E\u81EA\u52A8\u542F\u52A8\uFF0C\u4EFB\u9009\u4E00\u79CD\uFF1A" + "\r\n" +
+            "  1. \u5F00\u59CB\u83DC\u5355\u91CC\u6709 WorkBuddy \u7684\u5FEB\u6377\u65B9\u5F0F\u5373\u53EF\uFF08\u672C\u7A0B\u5E8F\u4F1A\u53BB\u90A3\u91CC\u627E\uFF09\uFF1B" + "\r\n" +
+            "  2. \u628A WorkBuddy.exe \u7684\u5B8C\u6574\u8DEF\u5F84\u5199\u8FDB\u6570\u636E\u76EE\u5F55\u4E0B\u7684 wb-path.txt\uFF1B" + "\r\n" +
+            "  3. \u628A\u5B8C\u6574\u8DEF\u5F84\u53CD\u9988\u7ED9\u4F5C\u8005\uFF0C\u4E0B\u4E00\u7248\u52A0\u8FDB\u68C0\u7D22\u8303\u56F4\u3002",
+            "WorkBuddy & PointPal", MessageBoxButtons.OK, MessageBoxIcon.Information);
+    }
+
+    // ---- locating WorkBuddy ------------------------------------------------
+    //
+    // WorkBuddy ships no uninstall entry, no App Paths key and no path-valued
+    // registry key (measured on the dev machine), so a Start menu shortcut is
+    // the only dependable clue. wb-path.txt and a drive sweep stay as fallbacks,
+    // in the same order the retired script used.
+    static string FindWorkBuddy() {
+        string wb = WbFromOverride();
+        if (wb == null) wb = WbFromStartMenu();
+        if (wb == null) wb = WbFromDrives();
+        if (wb == null) {
+            string la = Environment.GetEnvironmentVariable("LOCALAPPDATA");
+            string pf = Environment.GetEnvironmentVariable("ProgramFiles");
+            string p6 = Environment.GetEnvironmentVariable("ProgramFiles(x86)");
+            la = la == null ? "" : la; pf = pf == null ? "" : pf; p6 = p6 == null ? "" : p6;
+            wb = FirstExisting(new string[] {
+                Path.Combine(la, @"Programs\WorkBuddy\WorkBuddy.exe"),
+                Path.Combine(pf, @"WorkBuddy\WorkBuddy.exe"),
+                Path.Combine(p6, @"WorkBuddy\WorkBuddy.exe"),
+                Path.Combine(la, @"WorkBuddy\WorkBuddy.exe")
+            });
+        }
+        return wb;
+    }
+
+    // wb-path.txt holds full paths, one per line; the first one that exists
+    // wins. It is looked for in the data folder (writable without admin) and
+    // next to this exe, which is where the retired .vbs expected it.
+    static string WbFromOverride() {
+        string dataDir = ExeDataDir(), exeDir = ThisExeDir();
+        string[] spots = new string[] {
+            dataDir.Length == 0 ? "" : Path.Combine(dataDir, "wb-path.txt"),
+            exeDir.Length == 0 ? "" : Path.Combine(exeDir, "wb-path.txt")
+        };
+        foreach (string p in spots) {
+            try {
+                if (string.IsNullOrEmpty(p) || !File.Exists(p)) continue;
+                foreach (string raw in File.ReadAllLines(p)) {
+                    string line = raw.Trim();
+                    if (line.Length > 0 && File.Exists(line)) return line;
+                }
+            } catch { }
+        }
+        return null;
+    }
+
+    static string ExeDataDir() {
+        try {
+            return Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "WorkBuddy PointPal");
+        } catch { return ""; }
+    }
+
+    static string ThisExeDir() {
+        try { return Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location); }
+        catch { return ""; }
+    }
+
+    static string WbFromStartMenu() {
+        string appData = Environment.GetEnvironmentVariable("APPDATA");
+        string progData = Environment.GetEnvironmentVariable("ProgramData");
+        appData = appData == null ? "" : appData;
+        progData = progData == null ? "" : progData;
+        string[] roots = new string[] {
+            Path.Combine(appData, @"Microsoft\Windows\Start Menu\Programs"),
+            Path.Combine(progData, @"Microsoft\Windows\Start Menu\Programs")
+        };
+        foreach (string r in roots) {
+            string found = ScanMenuFor(r, 0);
+            if (found != null) return found;
+        }
+        return null;
+    }
+
+    // Recursive, depth-capped so a pathological tree cannot spin forever.
+    static string ScanMenuFor(string dir, int depth) {
+        if (depth > 6 || string.IsNullOrEmpty(dir)) return null;
+        try {
+            if (!Directory.Exists(dir)) return null;
+            foreach (string f in Directory.GetFiles(dir, "*.lnk")) {
+                string name = Path.GetFileName(f).ToLowerInvariant();
+                // Must mention WorkBuddy but NOT PointPal: our own shortcut also
+                // lives in the Start menu and would otherwise match itself.
+                if (name.IndexOf("workbuddy") >= 0 && name.IndexOf("pointpal") < 0) {
+                    string t = TargetOfLnk(f);
+                    if (t != null) return t;
+                }
+            }
+            foreach (string sub in Directory.GetDirectories(dir)) {
+                string t = ScanMenuFor(sub, depth + 1);
+                if (t != null) return t;
+            }
+        } catch { }
+        return null;
+    }
+
+    // Reads a .lnk through the Windows Script Host COM object, late-bound so no
+    // interop assembly is needed. Best-effort throughout: a missing COM
+    // registration or a broken shortcut just falls through to the next probe.
+    static string TargetOfLnk(string lnkPath) {
+        object shell = null;
+        try {
+            Type t = Type.GetTypeFromProgID("WScript.Shell");
+            if (t == null) return null;
+            shell = Activator.CreateInstance(t);
+            object lnk = t.InvokeMember("CreateShortcut", BindingFlags.InvokeMethod,
+                                        null, shell, new object[] { lnkPath });
+            string target = null, work = null;
+            try {
+                target = t.InvokeMember("TargetPath", BindingFlags.GetProperty, null, lnk, null) as string;
+            } catch { }
+            if (!string.IsNullOrEmpty(target)) {
+                if (target.EndsWith(".exe", StringComparison.OrdinalIgnoreCase) && File.Exists(target))
+                    return target;
+                try {
+                    string inDir = Path.Combine(target, "WorkBuddy.exe");
+                    if (Directory.Exists(target) && File.Exists(inDir)) return inDir;
+                } catch { }
+            }
+            try {
+                work = t.InvokeMember("WorkingDirectory", BindingFlags.GetProperty, null, lnk, null) as string;
+            } catch { }
+            if (!string.IsNullOrEmpty(work)) {
+                string p = Path.Combine(work, "WorkBuddy.exe");
+                if (File.Exists(p)) return p;
+            }
+        } catch {
+        } finally {
+            try { if (shell != null) Marshal.ReleaseComObject(shell); } catch { }
+        }
+        return null;
+    }
+
+    // Last resort: the handful of places WorkBuddy is normally installed to, on
+    // every ready fixed or removable drive.
+    static string WbFromDrives() {
+        string[] tails = new string[] {
+            @"Program Files\WorkBuddy\WorkBuddy.exe",
+            @"Program Files (x86)\WorkBuddy\WorkBuddy.exe",
+            @"WorkBuddy\WorkBuddy.exe",
+            @"Programs\WorkBuddy\WorkBuddy.exe",
+            @"Apps\WorkBuddy\WorkBuddy.exe"
+        };
+        try {
+            foreach (DriveInfo d in DriveInfo.GetDrives()) {
+                try {
+                    if (!d.IsReady) continue;
+                    if (d.DriveType != DriveType.Fixed && d.DriveType != DriveType.Removable) continue;
+                    foreach (string tail in tails) {
+                        string p = Path.Combine(d.RootDirectory.FullName, tail);
+                        if (File.Exists(p)) return p;
+                    }
+                } catch { }
+            }
+        } catch { }
+        return null;
+    }
+
+    static string FirstExisting(string[] list) {
+        foreach (string p in list) {
+            if (string.IsNullOrEmpty(p)) continue;
+            try { if (File.Exists(p)) return p; } catch { }
+        }
+        return null;
+    }
+
     [STAThread]
     public static void Main(string[] args) {
         // ---- single instance guard -------------------------------------
         // Test modes run as throwaway processes and must never be blocked by
         // (or steal the slot from) the user's real pet.
         bool isTestMode = WbPet.IsTestMode(args);
+        bool wantWb = WantsWorkBuddy(args);
         SingleInstance guard = null;
         if (!isTestMode) {
             guard = new SingleInstance();
@@ -4516,6 +4734,10 @@ public static class ExeEntry {
                 // quietly - no message box, no second window.
                 SingleInstance.WakeRunningPet();
                 guard.Dispose();
+                // A second press of the "start both" shortcut while the pet is
+                // already running must still bring WorkBuddy up: the pet half is
+                // already satisfied, the WorkBuddy half is not.
+                if (wantWb) LaunchWorkBuddy();
                 return;
             }
         }
@@ -4527,6 +4749,7 @@ public static class ExeEntry {
             Directory.CreateDirectory(baseDir);
             ExtractResources(baseDir);
             BootCredentials(baseDir);
+            if (wantWb) LaunchWorkBuddy();
             WbPet.Run(baseDir, args);
         } catch (Exception ex) {
             try {
