@@ -91,6 +91,9 @@ internal static class Native {
     public const int WS_EX_TOOLWINDOW = 0x00000080;
     public const int WS_EX_NOACTIVATE = 0x08000000;
     public const int WM_NCHITTEST = 0x0084;
+    // Broadcast to every top-level window when a display is added, removed, or
+    // reconfigured. Used only to rescue the widget if it lands off-screen.
+    public const int WM_DISPLAYCHANGE = 0x007E;
     public const int HTTRANSPARENT = -1;
     public const int HTCLIENT = 1;
 }
@@ -592,6 +595,669 @@ sealed class AboutDialog : Form {
     }
 }
 
+// ------------------------------------------------------------- settings -----
+//
+// One window for everything that is a SETTING rather than an action. The
+// right-click menu used to carry all of these inline and had grown to eleven
+// entries (2026-10-13). Tabs keep it short: display / charging / credential.
+//
+// Layout follows the same rules as InputDialog and AboutDialog, for the same
+// reasons: this process is DPI aware, so bounds are scaled by hand through
+// InputDialog.Ps() with AutoScaleMode off, and the window is centred on the
+// SCREEN (never CenterParent - the owner is the pet, a small top-most form
+// parked in a corner).
+//
+// Commit model (revised 2026-10-13 r2): the pet is the single source of truth,
+// but the dialog now buffers edits and only pushes them on 应用 / 确认. 取消
+// restores every touched setting to the value the dialog opened with. Without
+// this, a Cancel button would be a lie - the old build applied each change the
+// instant the widget changed.
+//
+// 应用 and 确认 differ only in whether the window closes: both flush the same
+// pending set, so a user who applies and then cancels still keeps what they
+// applied (the baseline moves with each apply).
+sealed class SettingsDialog : Form {
+    // Applies a new value; the pet re-renders and persists.
+    public Action<double> SetCm;
+    public Action<double> SetStep;
+    public Action<double> SetFloatMult;
+    public Action<string> SetLabel;
+    public Action<string> SetChar;
+    public Action<bool>   SetSound;
+    public Action<bool>   SetRememberScreen;
+    public Action         AskToken;          // opens the credential dialog
+
+    // Values as they were when the dialog opened - what 取消 restores.
+    readonly double _cm0, _step0, _floatMult0;
+    readonly string _label0, _char0;
+    readonly bool _sound0, _remember0;
+
+    // Pending values, edited by the widgets and flushed on apply/ok.
+    double _cm, _step, _floatMult;
+    string _label, _charId;
+    bool _sound, _remember;
+
+    // Live-updated widgets.
+    readonly NumPicker _sizePick;
+    readonly NumPicker _stepPick;
+    readonly NumPicker _floatPick;
+    readonly ComboBox _charBox = new ComboBox();
+    readonly CheckBox _soundBox = new CheckBox();
+    readonly TextBox  _labelBox = new TextBox();
+    readonly RadioButton _startRemember = new RadioButton();
+    readonly RadioButton _startPrimary  = new RadioButton();
+    readonly Label    _posHint = new Label();
+    readonly Label    _startupHint = new Label();
+    TabControl _tabs;                 // kept so --setsheet can walk the tabs
+
+    // Test hooks: --setsheet renders one tab at a time and reports which one it
+    // captured, so a screenshot can be tied to a tab without OCR.
+    internal void SelectTabForTest(int i) {
+        if (_tabs != null && i >= 0 && i < _tabs.TabPages.Count) _tabs.SelectedIndex = i;
+    }
+    internal string TabTitleForTest() {
+        return _tabs == null ? "(none)" : _tabs.SelectedTab.Text;
+    }
+
+    // Reports whether every control actually fits inside its tab's client
+    // area. A clipped row is invisible in a casual look and reads as "that
+    // option does not exist", so --setsheet asserts it.
+    internal string LayoutReport() {
+        if (_tabs == null) return "no tabs";
+        int worst = 0; string worstName = "";
+        foreach (TabPage p in _tabs.TabPages) {
+            int avail = p.ClientSize.Height;
+            foreach (Control c in p.Controls) {
+                int bottom = c.Bottom;
+                if (bottom > avail && bottom - avail > worst) {
+                    worst = bottom - avail; worstName = p.Text + "/" + c.Text;
+                }
+            }
+        }
+        bool radiosVisible =
+            _startRemember.Parent != null && _startPrimary.Parent != null &&
+            _startRemember.Bottom <= _startRemember.Parent.ClientSize.Height &&
+            _startPrimary.Bottom  <= _startPrimary.Parent.ClientSize.Height;
+        return "tabs=" + _tabs.TabPages.Count +
+               " tabClientH=" + _tabs.TabPages[0].ClientSize.Height +
+               " overflowWorst=" + worst + (worst > 0 ? " @" + worstName : "") +
+               " startupRadiosVisible=" + radiosVisible;
+    }
+
+    // Per-row bounds for the three numeric rows. Size is in centimetres, the
+    // floater multiplier in "x", the step in whatever the balance unit is.
+    // Kept in step with the WbPet-side clamps and state.ini reader.
+    internal const double SIZE_MAX_CM = 20.0;
+    internal const double STEP_MAX    = 999.99;
+    internal const double FLOAT_MAX   = 10.0;
+    // Floors differ too (asked 2026-10-13): a hair under half a centimetre
+    // renders the pet as a speck, so size and the floater multiplier stop at
+    // 0.5; the step is a money amount, where 0.01 is the sensible floor.
+    internal const double SIZE_MIN_CM = 0.5;
+    internal const double FLOAT_MIN   = 0.5;
+    internal const double STEP_MIN    = 0.01;
+    // Smallest of the three - for assertions that just need "some valid value".
+    internal const double NUM_MIN     = 0.01;
+
+    // Charging/display share the numeric presets that used to live in the menu.
+    static readonly double[] Sizes  = new double[] { 2.0, 3.0, 4.0, 6.0, 8.0 };
+    // EGG_STEPS stay out of this list on purpose - see WbPet.EGG_STEPS. The
+    // --eggsound self-check asserts that against this very array.
+    internal static readonly double[] Steps  = new double[] { 0.1, 1, 5, 10 };
+    static readonly double[] Floats = new double[] { 1, 2, 3, 4 };
+
+    // Read-only views for --pickertest, which rebuilds pickers from the same
+    // arrays the dialog uses so the assertions cannot drift from the real UI.
+    internal static double[] SizePresets  { get { return Sizes; } }
+    internal static double[] FloatPresets { get { return Floats; } }
+
+    public SettingsDialog(string title,
+                          double cm, double step, double floatMult,
+                          string label, string charId, bool sound, bool rememberScreen,
+                          CharSpec[] chars, string credBlockText) {
+        _cm0 = cm; _step0 = step; _floatMult0 = floatMult;
+        _label0 = label; _char0 = charId; _sound0 = sound; _remember0 = rememberScreen;
+        _cm = cm; _step = step; _floatMult = floatMult;
+        _label = label; _charId = charId; _sound = sound; _remember = rememberScreen;
+
+        Text = title;
+        FormBorderStyle = FormBorderStyle.FixedDialog;
+        StartPosition = FormStartPosition.CenterScreen;
+        MaximizeBox = false; MinimizeBox = false;
+        ShowInTaskbar = false;
+        TopMost = true;
+        AutoScaleMode = AutoScaleMode.None;
+        try { if (WbPet.AppIcon != null) Icon = WbPet.AppIcon; } catch { }
+
+        int w = InputDialog.Ps(DlgW);
+        int pad = InputDialog.Ps(DlgPad);
+        int tabH = InputDialog.Ps(DisplayTabHeight());
+
+        // Per-row limits (asked 2026-10-13): size tops out at 20cm, the
+        // floater multiplier at 10x, the deduction step keeps 999.99. All
+        // three share the 0.01 floor.
+        _sizePick  = new NumPicker(WbPet.SettingsCustomHint, SIZE_MIN_CM, SIZE_MAX_CM, _cm);
+        _stepPick  = new NumPicker(WbPet.SettingsCustomHint, STEP_MIN, STEP_MAX, _step);
+        _floatPick = new NumPicker(WbPet.SettingsCustomHint, FLOAT_MIN, FLOAT_MAX, _floatMult);
+        _sizePick.SetPresets(Sizes, WbPet.CmFor);
+        _stepPick.SetPresets(Steps, WbPet.FmtFor);
+        _floatPick.SetPresets(Floats, delegate (double v) { return WbPet.FmtFor(v) + " \u500D"; });
+        _sizePick.PresetChosen  += delegate (double v) { _cm = v; };
+        _stepPick.PresetChosen  += delegate (double v) { _step = v; };
+        _floatPick.PresetChosen += delegate (double v) { _floatMult = v; };
+        _sizePick.CustomEntered  += delegate (double v) { _cm = v; };
+        _stepPick.CustomEntered  += delegate (double v) { _step = v; };
+        _floatPick.CustomEntered += delegate (double v) { _floatMult = v; };
+
+        TabControl tabs = new TabControl();
+        _tabs = tabs;
+        tabs.Font = new Font("Microsoft YaHei", 9.75F);
+        tabs.Bounds = new Rectangle(pad, pad, w - pad * 2, tabH);
+        tabs.TabPages.Add(BuildDisplayTab(chars));
+        tabs.TabPages.Add(BuildChargeTab());
+        tabs.TabPages.Add(BuildCredTab(credBlockText));
+        Controls.Add(tabs);
+
+        int rowY = tabs.Bottom + InputDialog.Ps(12);
+        int btnH = InputDialog.Ps(30);
+        int btnW = InputDialog.Ps(76);
+        int gap  = InputDialog.Ps(8);
+
+        // Right to left: Apply, Cancel, OK - the Windows convention puts the
+        // commit button on the right. 确认 and 应用 both flush; 取消 reverts.
+        Button ok = new Button();
+        ok.Text = WbPet.SettingsBtnOk;
+        ok.DialogResult = DialogResult.OK;
+        ok.Bounds = new Rectangle(w - pad - btnW, rowY, btnW, btnH);
+        ok.Click += delegate { ApplyPending(); };
+
+        Button cancel = new Button();
+        cancel.Text = WbPet.SettingsBtnCancel;
+        cancel.DialogResult = DialogResult.Cancel;
+        cancel.Bounds = new Rectangle(w - pad - btnW * 2 - gap, rowY, btnW, btnH);
+        cancel.Click += delegate { RevertPending(); };
+
+        Button apply = new Button();
+        apply.Text = WbPet.SettingsBtnApply;
+        apply.Bounds = new Rectangle(w - pad - btnW * 3 - gap * 2, rowY, btnW, btnH);
+        apply.Click += delegate { ApplyPending(); };
+
+        Controls.Add(ok);
+        Controls.Add(cancel);
+        Controls.Add(apply);
+        ClientSize = new Size(w, rowY + btnH + pad);
+
+        // Widgets only touch the PENDING copies. Nothing reaches the pet until
+        // 应用 / 确认, which is what makes 取消 truthful.
+        _charBox.SelectedIndexChanged += delegate {
+            if (_charBox.SelectedIndex >= 0) _charId = chars[_charBox.SelectedIndex].Id;
+        };
+        _soundBox.CheckedChanged += delegate { _sound = _soundBox.Checked; };
+        _labelBox.Validated += delegate { CommitLabelEdit(); };
+        _labelBox.KeyDown += delegate (object s, KeyEventArgs e) {
+            if (e.KeyCode == Keys.Enter) { CommitLabelEdit(); e.SuppressKeyPress = true; }
+        };
+        _startRemember.CheckedChanged += delegate { if (_startRemember.Checked) _remember = true;  };
+        _startPrimary.CheckedChanged  += delegate { if (_startPrimary.Checked)  _remember = false; };
+
+        AcceptButton = ok;
+        CancelButton = cancel;
+    }
+
+    void CommitLabelEdit() {
+        string v = _labelBox.Text.Trim();
+        if (v.Length > 0) _label = v;
+    }
+
+    // Pushes every pending value through to the pet. Called by 应用 and 确认.
+    // The baseline is refreshed too, so a later 取消 keeps what was applied.
+    void ApplyPending() {
+        CommitLabelEdit();
+        if (SetCm != null) SetCm(_cm);
+        if (SetStep != null) SetStep(_step);
+        if (SetFloatMult != null) SetFloatMult(_floatMult);
+        if (SetLabel != null) SetLabel(_label);
+        if (SetChar != null) SetChar(_charId);
+        if (SetSound != null) SetSound(_sound);
+        if (SetRememberScreen != null) SetRememberScreen(_remember);
+    }
+
+    // Puts every setting back to the value the dialog opened with, and pushes
+    // that restored state out (the pet may already have been changed by an
+    // earlier 应用 in the same session).
+    void RevertPending() {
+        _cm = _cm0; _step = _step0; _floatMult = _floatMult0;
+        _label = _label0; _charId = _char0; _sound = _sound0; _remember = _remember0;
+        if (SetCm != null) SetCm(_cm);
+        if (SetStep != null) SetStep(_step);
+        if (SetFloatMult != null) SetFloatMult(_floatMult);
+        if (SetLabel != null) SetLabel(_label);
+        if (SetChar != null) SetChar(_charId);
+        if (SetSound != null) SetSound(_sound);
+        if (SetRememberScreen != null) SetRememberScreen(_remember);
+    }
+
+    static Font SmallFont() { return new Font("Microsoft YaHei", 8.25F); }
+
+    // ---- layout helpers ---------------------------------------------------
+    //
+    // EVERY coordinate in this class is tracked in UNSCALED 96-dpi units and
+    // converted ONCE, at the point of assignment. The first draft accumulated
+    // already-scaled values and then passed them through Ps() again, which
+    // double-scaled every row below the first and pushed the startup radios
+    // 101px past the bottom of the tab (caught by --setsheet, 2026-10-13).
+    // Scaling twice is the classic DPI bug here: see the P() rule.
+    const int DlgW      = 430;
+    const int DlgPad    = 14;
+    const int RowH      = 26;
+    const int RowGap    = 8;
+    const int TabPad    = 12;
+    const int LabW      = 96;
+    const int HintH     = 18;
+    // A numeric row is a preset combo plus a free-text box. The pair splits the
+    // row width 3:2 as asked: presets 3/5, editor 2/5 (minus the gap).
+    static int TabCtlW  { get { return DlgW - DlgPad * 2 - LabW - TabPad * 2; } }
+    static int PairGap  { get { return 6; } }
+    static int PresetW  { get { return (TabCtlW - PairGap) * 3 / 5; } }
+    static int EditW    { get { return TabCtlW - PairGap - PresetW; } }
+
+    // Height the display tab needs, in unscaled units. TabHeadH is the strip
+    // the TabControl spends on its tab buttons: the page client area is
+    // shorter than the control's own height, so the arithmetic must reserve it
+    // or the last row hangs below the fold.
+    const int TabHeadH  = 22;
+    static int DisplayTabHeight() {
+        return TabHeadH                     // the tab-button strip inside the control
+             + TabPad                       // top padding
+             + 3 * (RowH + RowGap)          // pet size, character, screen-label rows
+             + (HintH + 2)                  // "which screen" hint above the radios
+             + (RowH - 4)                   // "remember" radio
+             + RowH                         // "always primary" radio
+             + HintH                        // the "next launch only" hint
+             + TabPad;                      // bottom padding
+    }
+
+    // Places a label + control pair on a row. y is unscaled.
+    void AddRow(TabPage p, string label, Control ctl, int y) {
+        Label l = new Label();
+        l.Text = label;
+        l.Font = new Font("Microsoft YaHei", 9.75F);
+        l.AutoSize = false;                    // Bounds height is authoritative
+        l.TextAlign = ContentAlignment.MiddleLeft;
+        l.Bounds = new Rectangle(InputDialog.Ps(TabPad), InputDialog.Ps(y),
+                                 InputDialog.Ps(LabW), InputDialog.Ps(RowH));
+        p.Controls.Add(l);
+
+        ctl.Font = new Font("Microsoft YaHei", 9.75F);
+        ctl.Bounds = new Rectangle(InputDialog.Ps(TabPad + LabW), InputDialog.Ps(y),
+                                   InputDialog.Ps(TabCtlW), InputDialog.Ps(RowH));
+        p.Controls.Add(ctl);
+    }
+
+    // Places a NumPicker (preset combo + custom editor) on a row.
+    void AddPickerRow(TabPage p, string label, NumPicker pick, int y) {
+        Label l = new Label();
+        l.Text = label;
+        l.Font = new Font("Microsoft YaHei", 9.75F);
+        l.AutoSize = false;
+        l.TextAlign = ContentAlignment.MiddleLeft;
+        l.Bounds = new Rectangle(InputDialog.Ps(TabPad), InputDialog.Ps(y),
+                                 InputDialog.Ps(LabW), InputDialog.Ps(RowH));
+        p.Controls.Add(l);
+
+        int x = TabPad + LabW;
+        pick.Box.Bounds = new Rectangle(InputDialog.Ps(x), InputDialog.Ps(y),
+                                        InputDialog.Ps(PresetW), InputDialog.Ps(RowH));
+        pick.Edit.Bounds = new Rectangle(InputDialog.Ps(x + PresetW + PairGap), InputDialog.Ps(y),
+                                         InputDialog.Ps(EditW), InputDialog.Ps(RowH));
+        p.Controls.Add(pick.Box);
+        p.Controls.Add(pick.Edit);
+    }
+
+    // A one-off grey caption under a group of radios.
+    static Label HintLabel(string text, int x, int y, int w) {
+        Label h = new Label();
+        h.Text = text;
+        h.AutoSize = false;
+        h.ForeColor = SystemColors.GrayText;
+        h.Font = SmallFont();
+        h.Bounds = new Rectangle(InputDialog.Ps(x), InputDialog.Ps(y),
+                                 InputDialog.Ps(w), InputDialog.Ps(HintH));
+        return h;
+    }
+
+    TabPage BuildDisplayTab(CharSpec[] chars) {
+        TabPage p = new TabPage(WbPet.SettingsTabDisplay);
+        int y = TabPad;
+
+        AddPickerRow(p, WbPet.SettingsSizeLabel, _sizePick, y); y += RowH + RowGap;
+
+        AddRow(p, WbPet.SettingsCharLabel, _charBox, y); y += RowH + RowGap;
+        foreach (CharSpec c in chars) _charBox.Items.Add(c.Name);
+        _charBox.SelectedIndex = CharIndex(chars, _charId);
+        _charBox.DropDownStyle = ComboBoxStyle.DropDownList;
+
+        AddRow(p, WbPet.SettingsLabelLabel, _labelBox, y); y += RowH + RowGap;
+        _labelBox.Text = _label;
+
+        // "Which screen do you want the pet on next launch" - spelled out,
+        // because the pair of radios is otherwise easy to misread.
+        _startupHint.Text = WbPet.SettingsStartupHint;
+        _startupHint.AutoSize = false;
+        _startupHint.ForeColor = SystemColors.GrayText;
+        _startupHint.Font = SmallFont();
+        _startupHint.Bounds = new Rectangle(InputDialog.Ps(TabPad), InputDialog.Ps(y),
+                                            InputDialog.Ps(LabW + TabCtlW), InputDialog.Ps(HintH));
+        p.Controls.Add(_startupHint);
+        y += HintH + 2;
+
+        _startRemember.Text = WbPet.SettingsStartRemember;
+        _startRemember.Checked = _remember;
+        _startRemember.Font = new Font("Microsoft YaHei", 9.75F);
+        _startRemember.Bounds = new Rectangle(InputDialog.Ps(TabPad), InputDialog.Ps(y),
+                                              InputDialog.Ps(LabW + TabCtlW), InputDialog.Ps(RowH));
+        p.Controls.Add(_startRemember); y += RowH - 4;
+
+        _startPrimary.Text = WbPet.SettingsStartPrimary;
+        _startPrimary.Checked = !_remember;
+        _startPrimary.Font = new Font("Microsoft YaHei", 9.75F);
+        _startPrimary.Bounds = new Rectangle(InputDialog.Ps(TabPad), InputDialog.Ps(y),
+                                             InputDialog.Ps(LabW + TabCtlW), InputDialog.Ps(RowH));
+        p.Controls.Add(_startPrimary); y += RowH;
+
+        _posHint.Text = WbPet.SettingsPosHint;
+        _posHint.AutoSize = false;
+        _posHint.ForeColor = SystemColors.GrayText;
+        _posHint.Font = SmallFont();
+        _posHint.Bounds = new Rectangle(InputDialog.Ps(TabPad), InputDialog.Ps(y),
+                                        InputDialog.Ps(LabW + TabCtlW), InputDialog.Ps(HintH));
+        p.Controls.Add(_posHint);
+        return p;
+    }
+
+    TabPage BuildChargeTab() {
+        TabPage p = new TabPage(WbPet.SettingsTabCharging);
+        int y = TabPad;
+
+        AddPickerRow(p, WbPet.SettingsStepLabel, _stepPick, y); y += RowH + RowGap;
+        AddPickerRow(p, WbPet.SettingsFloatLabel, _floatPick, y); y += RowH + RowGap;
+
+        // The hit-sound switch moved here from the display tab and was renamed:
+        // it fires on a deduction, so it belongs with the charging settings.
+        _soundBox.Text = WbPet.SettingsSoundLabel;
+        _soundBox.Checked = _sound;
+        _soundBox.Font = new Font("Microsoft YaHei", 9.75F);
+        _soundBox.Bounds = new Rectangle(InputDialog.Ps(TabPad), InputDialog.Ps(y),
+                                         InputDialog.Ps(LabW + TabCtlW), InputDialog.Ps(RowH));
+        p.Controls.Add(_soundBox);
+        return p;
+    }
+
+    TabPage BuildCredTab(string blockText) {
+        TabPage p = new TabPage(WbPet.SettingsTabCredential);
+
+        Label body = new Label();
+        body.Text = blockText;
+        body.Font = new Font("Microsoft YaHei", 9.75F);
+        body.AutoSize = false;                 // Bounds height is authoritative
+        // MeasureText works in PHYSICAL pixels, so the measured height is NOT
+        // passed through Ps() a second time.
+        Size need = TextRenderer.MeasureText(
+            blockText, body.Font, new Size(InputDialog.Ps(LabW + TabCtlW), int.MaxValue),
+            TextFormatFlags.WordBreak);
+        int textH = need.Height + InputDialog.Ps(6);   // measured, not guessed
+        body.Bounds = new Rectangle(InputDialog.Ps(TabPad), InputDialog.Ps(TabPad),
+                                    InputDialog.Ps(LabW + TabCtlW), textH);
+        p.Controls.Add(body);
+
+        Button set = new Button();
+        set.Text = WbPet.SettingsSetToken;
+        set.Font = new Font("Microsoft YaHei", 9.75F);
+        set.Bounds = new Rectangle(InputDialog.Ps(TabPad),
+                                   InputDialog.Ps(TabPad) + textH + InputDialog.Ps(10),
+                                   InputDialog.Ps(140), InputDialog.Ps(30));
+        set.Click += delegate {
+            // The credential dialog is its own modal window. Apply first so the
+            // user does not lose pending edits when they go paste a token.
+            ApplyPending();
+            if (AskToken != null) AskToken();
+        };
+        p.Controls.Add(set);
+        return p;
+    }
+
+    // Index of the preset equal to v, else the closest one.
+    static int Nearest(double[] values, double v) {
+        int best = 0; double bestD = double.MaxValue;
+        for (int i = 0; i < values.Length; i++) {
+            double d = Math.Abs(values[i] - v);
+            if (d < bestD) { bestD = d; best = i; }
+        }
+        return best;
+    }
+
+    static int CharIndex(CharSpec[] chars, string id) {
+        for (int i = 0; i < chars.Length; i++) if (chars[i].Id == id) return i;
+        return 0;
+    }
+}
+
+// ---------------------------------------------------------- numeric picker --
+//
+// A preset dropdown plus a free-text editor, for one numeric setting. This
+// replaces the old menu's "presets + custom..." pair of rows: the two sit side
+// by side on a single line (asked 2026-10-13).
+//
+// How it reads:
+//   * on open, the box shows the setting's CURRENT value (not a placeholder):
+//     a saved preset selects that combo row, anything else shows up in the
+//     box with the combo on "自定义". Reopening therefore echoes what was
+//     saved instead of snapping back to the first preset (bug fixed
+//     2026-10-13: the ctor took an `initial` it never used).
+//   * the combo shows a preset name; the box is empty and shows the grey
+//     placeholder "自定义...".
+//   * typing a valid number into the box switches the combo to a "自定义" row
+//     and keeps only the digits in the box - which is what the user asked for,
+//     so the leftover placeholder never sits next to a real number.
+//   * picking a preset again clears the box and drops the "自定义" row.
+//
+// Input rules: at most two decimals, clamped to a per-setting [min, max]
+// (asked 2026-10-13; limits differ per row - size tops out at 20cm, the
+// floater multiplier at 10x - so the ceiling is a ctor argument, not a
+// constant). Enforcement is in the key handler rather than only on commit,
+// so an out-of-range character never appears and then vanishes.
+sealed class NumPicker {
+    // "custom..." - the grey placeholder and the synthetic combo label.
+    const string CUSTOM_ROW = "\u81EA\u5B9A\u4E49";      // custom
+
+    public readonly ComboBox Box = new ComboBox();
+    public readonly TextBox  Edit = new TextBox();
+
+    public event Action<double> PresetChosen;
+    public event Action<double> CustomEntered;
+
+    readonly string _placeholder;
+    readonly double _min, _max;
+    readonly double _initial;        // value the picker opens on (see ShowValue)
+    double[] _presets;
+    string[] _labels;
+    bool _customShown;               // is the "custom" row currently in the list?
+    bool _suppress;                  // guard against re-entrant SelectedIndexChanged
+
+    public NumPicker(string placeholder, double min, double max, double initial) {
+        _placeholder = placeholder;
+        _min = min; _max = max;
+        _initial = initial;
+
+        Box.Font = new Font("Microsoft YaHei", 9.75F);
+        Box.DropDownStyle = ComboBoxStyle.DropDownList;
+        Box.SelectedIndexChanged += delegate { OnPreset(); };
+
+        Edit.Font = new Font("Microsoft YaHei", 9.75F);
+        Edit.Text = placeholder;
+        Edit.ForeColor = SystemColors.GrayText;
+        Edit.GotFocus += delegate { if (IsPlaceholder) { Edit.Text = ""; Edit.ForeColor = SystemColors.WindowText; } };
+        Edit.LostFocus += delegate { if (Edit.Text.Trim().Length == 0) ShowPlaceholder(); };
+        Edit.KeyPress += delegate (object s, KeyPressEventArgs e) { e.Handled = !AllowChar(e.KeyChar); };
+        Edit.TextChanged += delegate { OnText(); };
+    }
+
+    bool IsPlaceholder { get { return Edit.Text == _placeholder && Edit.ForeColor == SystemColors.GrayText; } }
+
+    void ShowPlaceholder() {
+        Edit.Text = _placeholder;
+        Edit.ForeColor = SystemColors.GrayText;
+    }
+
+    // Digits, one dot, and at most two decimals. The integer-digit cap follows
+    // the ceiling (20cm admits 2 digits, 999.99 admits 3), so a value can be
+    // typed up to - but never past - its own limit. Backspace always passes.
+    bool AllowChar(char c) {
+        if (char.IsControl(c)) return true;
+        if (!char.IsDigit(c) && c != '.') return false;
+        if (IsPlaceholder) return true;                   // first keystroke replaces it
+        string cur = Edit.Text;
+        int sel = Edit.SelectionLength;
+        if (c == '.') return cur.IndexOf('.') < 0;
+        int dot = cur.IndexOf('.');
+        if (dot >= 0 && sel == 0 && cur.Length - dot - 1 >= 2) return false;   // 2 dp max
+        if (dot < 0 && sel == 0 && cur.Length >= IntDigits()) return false;    // int cap
+        return true;
+    }
+
+    // How many integer digits the ceiling allows (999.99 -> 3, 20 -> 2, 10 -> 2).
+    int IntDigits() {
+        int n = (int)Math.Floor(_max);
+        int d = 1;
+        while (n >= 10) { n /= 10; d++; }
+        return d;
+    }
+
+    public void SetPresets(double[] values, Func<double, string> label) {
+        _presets = values;
+        _labels = new string[values.Length];
+        for (int i = 0; i < values.Length; i++) _labels[i] = label(values[i]);
+        Box.Items.Clear();
+        foreach (string s in _labels) Box.Items.Add(s);
+        _customShown = false;
+        // Seed from the value the dialog opened with - NOT from Current(),
+        // which at this point still reads the untouched placeholder and so
+        // collapsed every row to its first preset (the reopen bug).
+        ShowValue(_initial);
+    }
+
+    // Renders v into the pair at open time, so a reopened dialog echoes what
+    // was saved. Two cases (asked 2026-10-13):
+    //   * the value IS a preset - the combo already says it, so the editor
+    //     goes back to the grey "自定义..." placeholder rather than repeating
+    //     the number the dropdown is showing;
+    //   * the value is not a preset (or carries more precision than the list
+    //     does) - the number lives in the editor and the combo reads 自定义.
+    public void ShowValue(double v) {
+        int hit = -1;
+        if (_presets != null) {
+            for (int i = 0; i < _presets.Length; i++)
+                if (Math.Abs(_presets[i] - v) < 1e-9) { hit = i; break; }
+        }
+        _suppress = true;
+        if (hit >= 0) {
+            ShowPlaceholder();                 // combo carries the value
+            Box.SelectedIndex = hit;
+        } else {
+            Edit.Text = v.ToString("0.##", CultureInfo.InvariantCulture);
+            Edit.ForeColor = SystemColors.WindowText;
+            if (!_customShown) { Box.Items.Add(CUSTOM_ROW); _customShown = true; }
+            Box.SelectedIndex = Box.Items.Count - 1;
+        }
+        _suppress = false;
+    }
+
+    // Index of the preset equal to v, else the closest one.
+    static int NearestIn(double[] values, double v) {
+        int best = 0; double bestD = double.MaxValue;
+        for (int i = 0; i < values.Length; i++) {
+            double d = Math.Abs(values[i] - v);
+            if (d < bestD) { bestD = d; best = i; }
+        }
+        return best;
+    }
+
+    // The value the picker currently represents (preset or typed).
+    double Current() {
+        double v;
+        if (!IsPlaceholder && double.TryParse(Edit.Text.Trim(), NumberStyles.Float,
+                                              CultureInfo.InvariantCulture, out v)) return v;
+        return (_presets != null && Box.SelectedIndex >= 0 && Box.SelectedIndex < _presets.Length)
+            ? _presets[Box.SelectedIndex] : _min;
+    }
+
+    // ---- test hooks (--pickertest) ---------------------------------------
+    // What the pair displays right now, without a message pump.
+    public double ShownValue() { return Current(); }
+    public bool IsCustomShown { get { return _customShown; } }
+    // True while the editor is showing the grey "自定义..." placeholder.
+    public bool IsShowingPlaceholder { get { return IsPlaceholder; } }
+    // Would the key handler accept every character of `digits`, starting from an
+    // empty (non-placeholder) box? Simulates the real editing path.
+    public bool AcceptsDigits(string digits) {
+        string saveText = Edit.Text; Color saveCol = Edit.ForeColor; int saveSel = Edit.SelectionLength;
+        try {
+            Edit.Text = ""; Edit.ForeColor = SystemColors.WindowText; Edit.SelectionLength = 0;
+            foreach (char c in digits) {
+                if (!AllowChar(c)) return false;
+                Edit.Text = Edit.Text + c;
+            }
+            return true;
+        } finally {
+            Edit.Text = saveText; Edit.ForeColor = saveCol; Edit.SelectionLength = saveSel;
+        }
+    }
+    // Runs `v` through the same clamp OnText applies, without touching the
+    // widgets. Proves the floor is enforced wherever a value enters.
+    public double CommitValue(double v) {
+        if (v < _min) v = _min;
+        if (v > _max) v = _max;
+        return v;
+    }
+
+    void EnsureCustomRow() {
+        if (_customShown) return;
+        Box.Items.Add(CUSTOM_ROW);
+        _customShown = true;
+    }
+
+    void OnPreset() {
+        if (_suppress) return;
+        int i = Box.SelectedIndex;
+        if (_customShown && i == Box.Items.Count - 1) return;   // the custom row itself
+        if (_presets == null || i < 0 || i >= _presets.Length) return;
+        // Picking a preset abandons whatever was typed.
+        _suppress = true;
+        if (IsPlaceholder || Edit.Text.Trim().Length > 0) ShowPlaceholder();
+        _suppress = false;
+        if (PresetChosen != null) PresetChosen(_presets[i]);
+    }
+
+    void OnText() {
+        if (_suppress) return;
+        string t = Edit.Text.Trim();
+        if (t.Length == 0 || IsPlaceholder) return;
+        double v;
+        if (!double.TryParse(t, NumberStyles.Float, CultureInfo.InvariantCulture, out v)) return;
+        v = CommitValue(v);                     // single home for the [min,max] clamp
+        // Switch the combo to "自定义" and keep the number in the box. Guarded,
+        // because editing the item list raises SelectedIndexChanged.
+        _suppress = true;
+        if (!_customShown) {
+            Box.Items.Add(CUSTOM_ROW);
+            _customShown = true;
+        }
+        Box.SelectedIndex = Box.Items.Count - 1;
+        _suppress = false;
+        if (CustomEntered != null) CustomEntered(v);
+    }
+}
+
 // ---------------------------------------------------------------- sound ----
 //
 // Overlapping hit sounds through the Win32 MCI interface: every cue is played
@@ -846,6 +1512,60 @@ public sealed class WbPet : Form {
         const string S_SOUNDMENU="\u53D7\u51FB\u97F3\u6548";                         // hit sound toggle
     const string S_ABOUT   = "\u5173\u4E8E...";                                  // about...
     const string S_ABOUTT  = "\u5173\u4E8E";                                     // about (title)
+    // ---- settings dialog (1.2.19) -----------------------------------------
+    // The right-click menu had grown to eleven entries, eight of which were
+    // settings rather than actions. They moved into one dialog opened from a
+    // "settings..." entry sitting directly above "about..." (asked 2026-10-13).
+    // The menu now keeps only the per-session ACTIONS - refresh, test a charge,
+    // demo charges, settings, about, quit.
+    const string S_SETTINGS  = "\u8BBE\u7F6E...";                                // settings...
+    const string S_SETTINGST = "\u8BBE\u7F6E";                                   // settings (title)
+    const string S_TAB_DISP  = "\u663E\u793A";                                   // tab: display
+    const string S_TAB_CHARGE= "\u6263\u8D39";                                   // tab: charging
+    const string S_TAB_CRED  = "\u51ED\u8BC1";                                   // tab: credential
+    const string S_STARTUP   = "\u542F\u52A8\u843D\u70B9";                       // startup position
+    const string S_START_REM = "\u8BB0\u4F4F\u4E0A\u6B21\u6240\u5728\u5C4F\u5E55";   // remember last screen
+    const string S_START_PRI = "\u59CB\u7EC8\u843D\u5728\u4E3B\u5C4F\u5E55";         // always the primary
+    const string S_POS_HINT  = "\u4EC5\u5F71\u54CD\u4E0B\u6B21\u542F\u52A8\uFF0C\u5F53\u524D\u4F4D\u7F6E\u4E0D\u53D8\u3002"; // affects next launch only
+    // New for 1.2.19 r2 (asked 2026-10-13):
+    //   * the size row gets a clearer name now that it shares a dialog with
+    //     other "sizes" (step / damage font);
+    //   * the hit-sound switch is really a CHARGING sound, and lives on the
+    //     charging tab now, so it is renamed to match;
+    //   * the startup-position pair gets a one-line "what am I choosing" hint;
+    //   * OK/Cancel/Apply get Chinese captions to match the rest of the UI.
+    const string S_SIZEMENU  = "\u684C\u5BA0\u5C3A\u5BF8";                       // pet size
+    const string S_SOUND_MENU2="\u6263\u8D39\u97F3\u6548";                       // charging sound
+    const string S_STARTUP_HINT="\u9009\u62E9\u4E0B\u6B21\u542F\u52A8\u65F6\u684C\u5BA0\u843D\u5728\u54EA\u5757\u5C4F\u5E55\u3002"; // which screen next launch
+    const string S_BTN_OK    = "\u786E\u8BA4";                                   // OK
+    const string S_BTN_CANCEL= "\u53D6\u6D88";                                   // Cancel
+    const string S_BTN_APPLY = "\u5E94\u7528";                                   // Apply
+
+    // The settings dialog is a separate class, so the handful of strings it
+    // needs are surfaced here rather than duplicated. Also lets --settest
+    // print the exact labels the window will show.
+    internal static string SettingsTabDisplay    { get { return S_TAB_DISP; } }
+    internal static string SettingsTabCharging   { get { return S_TAB_CHARGE; } }
+    internal static string SettingsTabCredential { get { return S_TAB_CRED; } }
+    internal static string SettingsSizeLabel     { get { return S_SIZEMENU; } }
+    internal static string SettingsCharLabel     { get { return S_CHARMENU; } }
+    internal static string SettingsLabelLabel    { get { return S_LBLT; } }
+    internal static string SettingsSoundLabel    { get { return S_SOUND_MENU2; } }
+    internal static string SettingsStepLabel     { get { return S_STEPMENU; } }
+    internal static string SettingsFloatLabel    { get { return S_FLOTMENU; } }
+    internal static string SettingsStartRemember { get { return S_START_REM; } }
+    internal static string SettingsStartPrimary  { get { return S_START_PRI; } }
+    internal static string SettingsPosHint       { get { return S_POS_HINT; } }
+    internal static string SettingsStartupHint   { get { return S_STARTUP_HINT; } }
+    internal static string SettingsSetToken      { get { return S_SETTOKEN; } }
+    internal static string SettingsCustomHint    { get { return S_CUSTOM; } }     // "custom..."
+    internal static string SettingsBtnOk         { get { return S_BTN_OK; } }
+    internal static string SettingsBtnCancel     { get { return S_BTN_CANCEL; } }
+    internal static string SettingsBtnApply      { get { return S_BTN_APPLY; } }
+    // Reuse the widget's own formatters so the combo boxes read exactly like
+    // the menu rows they replace.
+    internal static string CmFor(double v)  { return CmLabel(v); }
+    internal static string FmtFor(double v) { return FmtAmt(v); }
     // ---- update check (About > "check for updates") ----------------------
     // The check reads the 302 that github.com itself returns for
     // /releases/latest. That redirect is served by github.com, NOT by
@@ -885,13 +1605,26 @@ public sealed class WbPet : Form {
         "2. \u6309 F12 \u6253\u5F00\u5F00\u53D1\u8005\u5DE5\u5177\uFF0C\u5207\u5230 Network\uFF08\u7F51\u7EDC\uFF09\u6807\u7B7E\u9875\r\n" +
         "3. \u9009\u62E9\u67E5\u770B Doc\uFF08\u6587\u6863\uFF09\u7C7B\u578B\u7684\u8BF7\u6C42\uFF0C\u5237\u65B0\u9875\u9762\r\n" +
         "4. \u627E\u5230 www.workbuddy.cn\uFF0C\u53F3\u952E \u2192 \u590D\u5236 \u2192 \u4EE5 cURL \u683C\u5F0F\u590D\u5236\uFF08bash\uFF09\r\n" +
-        "5. \u53F3\u952E\u684C\u5BA0 \u2192 \u8BBE\u7F6E\u767B\u5F55\u51ED\u8BC1\uFF0C\u6574\u6BB5\u7C98\u8D34\u5373\u53EF\r\n\r\n" +
+        "5. \u53F3\u952E\u684C\u5BA0 \u2192 \u8BBE\u7F6E\u2026 \u2192 \u51ED\u8BC1\u9875\u7B7E \u2192 \u8BBE\u7F6E\u767B\u5F55\u51ED\u8BC1\uFF0C\u6574\u6BB5\u7C98\u8D34\u5373\u53EF\r\n\r\n" +
         "\u7A0B\u5E8F\u4F1A\u81EA\u52A8\u4ECE cURL \u91CC\u63D0\u53D6 Cookie \u548C User-Agent\u3002\r\n" +
         "\u91CD\u8981\uFF1A\u7F51\u5173\u628A\u767B\u5F55\u4F1A\u8BDD\u7ED1\u5B9A\u5230\u6D4F\u89C8\u5668\u7684 User-Agent\uFF0C\r\n" +
         "\u5FC5\u987B\u6574\u6BB5 cURL \u4E00\u8D77\u7C98\uFF0C\u53EA\u7C98 Cookie \u4E0D\u5E26 UA \u5FC5\u5B9A 401\u3002\r\n" +
         "\u82E5\u590D\u5236\u7684\u662F cURL\uFF08cmd\uFF09\u6216 PowerShell \u683C\u5F0F\uFF0C\u8BF7\u6539\u7528 cURL\uFF08bash\uFF09\u3002";
 
     readonly string _baseDir;
+    // Everything the pet writes is split into two subfolders of the data
+    // directory, so neither kind of file can be mistaken for the other:
+    //   userdata\  - token.txt / state.ini / pet.log / wb-path.txt (user's
+    //                own data; an uninstall only removes it on request)
+    //   shots\     - the self-check PNGs (--shot, --selftest, --aboutsheet,
+    //                --toksheet, --setsheet, --updsheet, --updfound). These
+    //                are throwaway build artefacts: a fresh self-check wipes
+    //                the folder first, and an uninstall always removes it.
+    // The unpacked artwork (sprite.png, characters\, *.mp3, icon) stays in the
+    // data folder root on purpose: it is a writable copy of an embedded
+    // resource, not user data - see ExtractResources().
+    readonly string _userDir;
+    readonly string _shotsDir;
     readonly string _apiUrl;
     readonly int _pollMs;
     string _token;
@@ -907,19 +1640,95 @@ public sealed class WbPet : Form {
     // menu path can ever write the file.
     bool _suppressSave;
 
+    // Subfolders of the data directory. Both are shared with the uninstaller,
+    // which deletes them by name, so keep the strings in one place.
+    public const string UserSubdir  = "userdata";
+    public const string ShotsSubdir = "shots";
+    // Files that used to live in the data folder root and now belong in
+    // userdata\. Migrated on launch (MoveOldDataFiles) and looked up in both
+    // places on read, so an upgrade never loses the user's credentials.
+    public static readonly string[] UserFiles = new string[] {
+        "token.txt", "state.ini", "pet.log", "wb-path.txt"
+    };
+
+    // pet.log lives in userdata\ now. Static so the SoundPool call sites (some
+    // of which are static helpers) can reach it from a bare baseDir.
+    public static string LogFileIn(string baseDir) {
+        return Path.Combine(baseDir, UserSubdir, "pet.log");
+    }
+
     // One list, so the mutex guard, the first-run dialog guard and the credential
     // guard can never drift apart.
     public static readonly string[] TestModes = new string[] {
         "--selftest", "--shot", "--credtest", "--credcheck",
         "--soundtest", "--soundprobe", "--soundsoak", "--soundab", "--simchain",
-        "--abouttest", "--aboutsheet", "--toksheet", "--updtest", "--updsheet",
+        "--abouttest", "--aboutsheet", "--toksheet", "--setsheet", "--updtest", "--updsheet",
         "--updnet", "--updfound", "--eggsound", "--eggsoundlive", "--aliascheck",
-        "--wbtest", "--cryptest"
+        "--wbtest", "--cryptest", "--pickertest", "--rescuetest"
     };
     public static bool IsTestMode(string[] args) {
         foreach (string a in args)
             if (Array.IndexOf(TestModes, a) >= 0) return true;
         return false;
+    }
+
+    // The subset of test modes that write PNGs into shots\. Kept separate from
+    // TestModes because the wipe (below) must not fire for the logic-only modes
+    // (--eggsound, --aliascheck, ...) that never touch that folder.
+    public static readonly string[] SheetModes = new string[] {
+        "--shot", "--selftest", "--aboutsheet", "--toksheet",
+        "--setsheet", "--updsheet", "--updfound"
+    };
+    public static bool WantsSheets(string[] args) {
+        foreach (string a in args)
+            if (Array.IndexOf(SheetModes, a) >= 0) return true;
+        return false;
+    }
+
+    // A self-check run starts from an empty folder: the last run's PNGs are
+    // stale by definition, and leaving them behind made it impossible to tell
+    // "the newest render" from "something an earlier build wrote". Called once,
+    // before the first artefact is saved.
+    public static void ClearShots(string shotsDir) {
+        try {
+            if (!Directory.Exists(shotsDir)) return;
+            foreach (string f in Directory.GetFiles(shotsDir)) {
+                try { File.Delete(f); } catch { }
+            }
+            foreach (string d in Directory.GetDirectories(shotsDir)) {
+                try { Directory.Delete(d, true); } catch { }
+            }
+        } catch { }
+    }
+
+    // Resolve an artefact path the way the rendering modes expect: an argument
+    // WITH a directory component is honoured as given (callers may point at an
+    // absolute path), while a bare file name lands in shots\ rather than in
+    // whatever the process CWD happens to be. Before this, a relative name went
+    // to the data folder root, which is exactly where the clutter came from.
+    public static string ResolveShot(string shotsDir, string arg, string fallback) {
+        string name = string.IsNullOrEmpty(arg) ? fallback : arg;
+        if (string.IsNullOrEmpty(name)) return shotsDir;
+        try {
+            if (Path.IsPathRooted(name)) return name;
+            string dir = Path.GetDirectoryName(name);
+            if (!string.IsNullOrEmpty(dir)) return name;   // explicit sub-path
+            return Path.Combine(shotsDir, name);
+        } catch { return Path.Combine(shotsDir, name); }
+    }
+
+    // Same rule for the two multi-file modes (--setsheet / --updsheet), which
+    // take a DIRECTORY. An empty argument now means shots\<sub> rather than the
+    // process CWD, which is what used to litter the data folder root.
+    public static string ResolveSheetDir(string shotsDir, string arg) {
+        const string sub = "sheets";
+        try {
+            if (string.IsNullOrEmpty(arg)) return Path.Combine(shotsDir, sub);
+            if (Path.IsPathRooted(arg)) return arg;
+            string parent = Path.GetDirectoryName(arg);
+            if (!string.IsNullOrEmpty(parent)) return arg;
+            return Path.Combine(shotsDir, arg);
+        } catch { return Path.Combine(shotsDir, sub); }
     }
 
     Bitmap _flat, _flatFlip, _sprNormal, _sprRed, _canvas;
@@ -1011,12 +1820,38 @@ public sealed class WbPet : Form {
 
     bool _drag; Point _dragStart, _winStart;
     bool _snapping; double _snapT; Point _snapFrom, _snapTo;
+    // Reachability watchdog (1.2.19). A monitor unplugged while the widget
+    // sat on it can leave the window parked off every screen, and
+    // WM_DISPLAYCHANGE is neither guaranteed to arrive nor guaranteed to
+    // arrive after the new topology is committed - so relying on that one
+    // message left the pet invisible until restart (the "pulled the cable,
+    // pet vanished" report, 2026-10-13). Hence: re-check hard for a moment
+    // after a display change, then once in a while forever.
+    const double WATCHDOG_MS      = 5000;   // idle backstop cadence
+    const double RESCUE_BURST_MS  = 1500;   // fast re-checks after a change
+    double _watchdogAccum;                  // ms since the last idle check
+    double _rescueBurstLeft;                // ms of fast checking remaining
+    // "Remember which screen" (1.2.19). true = on the next launch, come back to
+    // the same corner of the same monitor the user last settled on; false = the
+    // historical behaviour of always starting bottom-left of the primary screen.
+    // Both branches still snap to a corner at launch - this only chooses WHICH
+    // corner. Persisted as posmode in state.ini.
+    bool _rememberScreen;
+    // The last settled corner, normalised against the primary screen so it can
+    // be rebuilt after a reboot even if monitor numbers shuffle. -1 = "never
+    // recorded", which makes the first launch after an upgrade fall back to the
+    // primary screen rather than guessing.
+    bool _anchorValid;
+    Rectangle _anchorWa;             // work area of the screen it was dropped on
+    Rectangle _anchorPrimary;        // primary work area when it was recorded
+    bool _anchorRight;               // which bottom corner
     byte[] _hitMap; int _hitW, _hitH;
     // shared app icon (DaFeiYu.ico when present): tray + dialogs
     public static Icon AppIcon;
     NotifyIcon _tray;
     ContextMenuStrip _menu;
-    ToolStripMenuItem _sizeItem, _stepItem, _floatItem, _charItem, _soundItem;
+    // No per-setting menu items any more: those live in SettingsDialog
+    // (1.2.19). The menu is actions only, so there is nothing to keep checked.
     int _demoLeft;                   // cues left in a rehearsal run
     double _demoAmount = 1;
 
@@ -1039,6 +1874,8 @@ public sealed class WbPet : Form {
 
     public WbPet(string baseDir, string[] args) {
         _baseDir = baseDir;
+        _userDir = Path.Combine(baseDir, UserSubdir);
+        _shotsDir = Path.Combine(baseDir, ShotsSubdir);
         _token   = Get("WBPET_TOKEN", "");
         _uid     = Get("WBPET_UID", "");
         _ua      = Get("WBPET_UA", "");
@@ -1069,7 +1906,7 @@ public sealed class WbPet : Form {
         string sndPath = Path.Combine(baseDir, Get("WBPET_SOUND_FILE", "hit.mp3"));
         if (_soundWanted && File.Exists(sndPath)) {
             int vol = int.Parse(Get("WBPET_VOLUME", "80"));
-            _sound = new SoundPool(sndPath, 4, vol, Path.Combine(baseDir, "pet.log"));
+            _sound = new SoundPool(sndPath, 4, vol, LogFileIn(baseDir));
             if (_sound.Failed) Log("sound pool failed: " + _sound.Error);
             else Log("sound ready: " + sndPath + " volume=" + vol);
         } else if (_soundWanted) {
@@ -1092,7 +1929,7 @@ public sealed class WbPet : Form {
         _soundEnabled = _soundWanted;
         LoadCharacter();             // bitmaps + geometry for _char
         Relayout();
-        SnapToCorner(true);
+        PlaceOnStartup();
         BuildMenu();
 
         // First run: nothing configured a token, so ask once instead of leaving
@@ -1263,84 +2100,13 @@ public sealed class WbPet : Form {
 
         _menu.Items.Add(new ToolStripSeparator());
 
-        _sizeItem = new ToolStripMenuItem(S_SIZE);
-        double[] sizes = new double[] { 1.5, 2.0, 3.0, 4.0, 6.0, 8.0 };
-        foreach (double s in sizes) {
-            double v = s;
-            ToolStripMenuItem it = new ToolStripMenuItem(CmLabel(v));
-            it.Click += delegate { SetCm(v); };
-            _sizeItem.DropDownItems.Add(it);
-        }
-        _sizeItem.DropDownItems.Add(new ToolStripSeparator());
-        ToolStripMenuItem sizeCustom = new ToolStripMenuItem(S_CUSTOM);
-        sizeCustom.Click += delegate { AskCm(); };
-        _sizeItem.DropDownItems.Add(sizeCustom);
-        _menu.Items.Add(_sizeItem);
-
-        // submenu: credits per hurt animation
-        _stepItem = new ToolStripMenuItem(S_STEPMENU);
-        // The easter-egg steps (see EGG_STEPS) are deliberately NOT listed
-        // here: the whole point is that the user stumbles onto them. They
-        // still work when typed into "custom" - SetStep() takes any value.
-        double[] steps = new double[] { 0.1, 1, 5, 10 };
-        foreach (double s in steps) {
-            double v = s;
-            ToolStripMenuItem it = new ToolStripMenuItem(FmtAmt(v));
-            it.Click += delegate { SetStep(v); };
-            _stepItem.DropDownItems.Add(it);
-        }
-        _stepItem.DropDownItems.Add(new ToolStripSeparator());
-        ToolStripMenuItem stepCustom = new ToolStripMenuItem(S_CUSTOM);
-        stepCustom.Click += delegate { AskStep(); };
-        _stepItem.DropDownItems.Add(stepCustom);
-        _menu.Items.Add(_stepItem);
-
-        // submenu: damage-number size multiplier
-        _floatItem = new ToolStripMenuItem(S_FLOTMENU);
-        double[] mults = new double[] { 1, 2, 3, 4 };
-        foreach (double s in mults) {
-            double v = s;
-            ToolStripMenuItem it = new ToolStripMenuItem(FmtAmt(v) + " \u500D");   // "N bei"
-            it.Click += delegate { SetFloatMult(v); };
-            _floatItem.DropDownItems.Add(it);
-        }
-        _floatItem.DropDownItems.Add(new ToolStripSeparator());
-        ToolStripMenuItem floatCustom = new ToolStripMenuItem(S_CUSTOM);
-        floatCustom.Click += delegate { AskFloatMult(); };
-        _floatItem.DropDownItems.Add(floatCustom);
-        _menu.Items.Add(_floatItem);
-
-        ToolStripMenuItem lbl = new ToolStripMenuItem(S_LBLMENU);
-        lbl.Click += delegate { AskLabel(); };
-        _menu.Items.Add(lbl);
-
-        _menu.Items.Add(new ToolStripSeparator());
-
-        // submenu: pick the character
-        _charItem = new ToolStripMenuItem(S_CHARMENU);
-        foreach (CharSpec c in Chars) {
-            CharSpec cc = c;
-            ToolStripMenuItem it = new ToolStripMenuItem(cc.Name);
-            it.Tag = cc.Id;
-            it.Click += delegate { SetCharacter(cc.Id); };
-            _charItem.DropDownItems.Add(it);
-        }
-        _menu.Items.Add(_charItem);
-
-        // hit sound on/off
-        _soundItem = new ToolStripMenuItem(S_SOUNDMENU);
-        _soundItem.Click += delegate { ToggleSound(); };
-        _menu.Items.Add(_soundItem);
-
-        _menu.Items.Add(new ToolStripSeparator());
-
-        ToolStripMenuItem key = new ToolStripMenuItem(S_SETTOKEN);
-        key.Click += delegate { AskToken(); };
-        _menu.Items.Add(key);
-
-        // The credential guide is no longer a menu entry: it now opens from a
-        // button inside the credential dialog itself, where the user actually
-        // needs it. See InputDialog.GUIDE_LABEL.
+        // Everything that used to sit between here and "about" moved into the
+        // settings dialog (2026-10-13): size, step, damage-number size, screen
+        // label, character, hit sound and the credential entry. The menu keeps
+        // only the per-session ACTIONS, which is what it is for.
+        ToolStripMenuItem settings = new ToolStripMenuItem(S_SETTINGS);
+        settings.Click += delegate { ShowSettings(); };
+        _menu.Items.Add(settings);
 
         // Second to last, directly above Quit, as a conventional place for it.
         ToolStripMenuItem about = new ToolStripMenuItem(S_ABOUT);
@@ -1367,28 +2133,10 @@ public sealed class WbPet : Form {
         return v.ToString("0.#", CultureInfo.InvariantCulture) + " cm";
     }
 
-    // ToolStrip check marks are reset on every open, so push them here.
+    // The menu carries no checkable rows since 1.2.19 (they moved into the
+    // settings dialog), so there is nothing left to refresh. Kept as a named
+    // no-op because the Opening hook and a couple of tests still call it.
     void RefreshMenuChecks() {
-        string curSize = CmLabel(_cm);
-        foreach (ToolStripItem it in _sizeItem.DropDownItems) {
-            ToolStripMenuItem mi = it as ToolStripMenuItem;
-            if (mi != null && mi.Text != S_CUSTOM) mi.Checked = (mi.Text == curSize);
-        }
-        string curStep = FmtAmt(_step);
-        foreach (ToolStripItem it in _stepItem.DropDownItems) {
-            ToolStripMenuItem mi = it as ToolStripMenuItem;
-            if (mi != null && mi.Text != S_CUSTOM) mi.Checked = (mi.Text == curStep);
-        }
-        string curMult = FmtAmt(_floatMult) + " \u500D";
-        foreach (ToolStripItem it in _floatItem.DropDownItems) {
-            ToolStripMenuItem mi = it as ToolStripMenuItem;
-            if (mi != null && mi.Text != S_CUSTOM) mi.Checked = (mi.Text == curMult);
-        }
-        foreach (ToolStripItem it in _charItem.DropDownItems) {
-            ToolStripMenuItem mi = it as ToolStripMenuItem;
-            if (mi != null) mi.Checked = ((string)mi.Tag == _char.Id);
-        }
-        _soundItem.Checked = _soundWanted;
     }
 
     // ------------------------------------------------------------- settings ---
@@ -1460,6 +2208,35 @@ public sealed class WbPet : Form {
     // cannot silently drift from the installer's. Only the 3-part form is
     // printed: the stored value is "1.2.9.0" and the trailing ".0" is noise.
     //
+    // Everything that used to be its own menu row now lives in one window
+    // (2026-10-13). The dialog is handed the current values and a set of
+    // callbacks back into the pet, so the pet keeps owning all state.
+    void ShowSettings() {
+        using (SettingsDialog d = new SettingsDialog(
+                   S_SETTINGST, _cm, _step, _floatMult, _label, _char.Id,
+                   _soundWanted, _rememberScreen, Chars, SettingsCredBlock())) {
+            d.SetCm = SetCm;
+            d.SetStep = SetStep;
+            d.SetFloatMult = SetFloatMult;
+            d.SetLabel = delegate (string v) { SetLabel(v); };
+            d.SetChar = SetCharacter;
+            d.SetSound = delegate (bool on) { if (on != _soundWanted) ToggleSound(); };
+            d.SetRememberScreen = SetRememberScreen;
+            d.AskToken = AskToken;
+            d.ShowDialog(this);
+        }
+    }
+
+    // The text on the credential tab. Short: the long "how do I get one" walk
+    // through is the button inside the credential dialog itself.
+    string SettingsCredBlock() {
+        bool has = !string.IsNullOrEmpty(_token);
+        return S_SETTOKEN + "\uFF1A" + (has ? "\u5DF2\u8BBE\u7F6E" : "\u672A\u8BBE\u7F6E") + "\r\n\r\n" +
+               "\u51ED\u8BC1\u4FDD\u5B58\u5728\u672C\u673A\u6570\u636E\u76EE\u5F55\uFF0C" +
+               "\u7ECF DPAPI \u672C\u7528\u6237\u52A0\u5BC6\uFF0C\u53EF\u5728\u4E0B\u65B9\u91CD\u65B0\u8BBE\u7F6E\u3002\r\n" +
+               "\u8FC7\u671F\u540E\u5E94\u7528\u4F1A\u7EA2\u70B9\u63D0\u9192\uFF0C\u5230\u65F6\u91CD\u65B0\u7C98\u8D34 cURL \u5373\u53EF\u3002";
+    }
+
     // This used to be a plain MessageBox. It is now a small dialog because the
     // check-update button has to live somewhere, and a MessageBox cannot host
     // a third button that is neither OK nor Cancel (asked for 2026-10-02).
@@ -1983,24 +2760,284 @@ public sealed class WbPet : Form {
         Console.WriteLine("toksheet written: " + path);
     }
 
+    // --setsheet <dir>: render the settings dialog once per tab, so the layout
+    // of a window that is otherwise only reachable by right-clicking the pet
+    // can be reviewed offline at the real DPI. Purely local.
+    public void SaveSettingsSheet(string dir) {
+        try { if (!Directory.Exists(dir)) Directory.CreateDirectory(dir); } catch { }
+        string[] names = new string[] { "set_display.png", "set_charge.png", "set_cred.png" };
+        for (int tab = 0; tab < names.Length; tab++) {
+            using (SettingsDialog d = new SettingsDialog(
+                       S_SETTINGST, _cm, _step, _floatMult, _label, _char.Id,
+                       _soundWanted, _rememberScreen, Chars, SettingsCredBlock())) {
+                d.StartPosition = FormStartPosition.Manual;
+                d.Location = new Point(-10000, -10000);
+                d.Show();
+                d.SelectTabForTest(tab);
+                // Pump until the controls have been placed and painted; a single
+                // DoEvents() captures the window mid-layout (blank form, children
+                // still at 0,0). Bounded so a headless session cannot spin.
+                DateTime deadline = DateTime.UtcNow.AddSeconds(2);
+                while (DateTime.UtcNow < deadline) {
+                    Application.DoEvents();
+                    System.Threading.Thread.Sleep(30);
+                    break;   // one settle pass is enough for a static dialog
+                }
+                Console.WriteLine("setlayout[" + tab + "]: client=" +
+                                  d.ClientSize.Width + "x" + d.ClientSize.Height +
+                                  " tab=" + d.TabTitleForTest());
+                Console.WriteLine("setfit[" + tab + "]: " + d.LayoutReport());
+                using (Bitmap b = new Bitmap(d.Width, d.Height)) {
+                    d.DrawToBitmap(b, new Rectangle(0, 0, d.Width, d.Height));
+                    b.Save(Path.Combine(dir, names[tab]), ImageFormat.Png);
+                }
+                d.Close();
+            }
+        }
+        Console.WriteLine("setsheet written: " + dir);
+    }
+
+    // --rescuetest: run with the widget stranded where a monitor used to be.
+    // A headless geometry test - the real unplug cannot be scripted, but the
+    // consequence can: the widget sits entirely outside every screen and must
+    // come back. Also pins the promise that a REACHABLE widget is untouched
+    // (a deliberate drop on a second monitor stays put).
+    public void RunRescueTest() {
+        Console.WriteLine("off-screen rescue regression (--rescuetest)");
+        int pass = 0, fail = 0;
+        Action<string, bool> check = delegate (string name, bool ok) {
+            Console.WriteLine("  " + (ok ? "PASS  " : "FAIL  ") + name);
+            if (ok) pass++; else fail++;
+        };
+
+        Console.WriteLine("  screens = " + Screen.AllScreens.Length);
+        foreach (Screen sc in Screen.AllScreens)
+            Console.WriteLine("    " + sc.DeviceName + " bounds=" + sc.Bounds +
+                              " work=" + sc.WorkingArea + " primary=" + sc.Primary);
+
+        // 1. Stranded: park the widget past the right edge of the virtual
+        //    desktop, i.e. exactly where a monitor that just left used to be.
+        Rectangle vd = SystemInformation.VirtualScreen;
+        Point stranded = new Point(vd.Right + 1200, vd.Top + 200);
+        Location = stranded;
+        check("a stranded widget is detected as off-screen", !IsOnSomeScreenPublic);
+        ForceDisplayChangeForTest();
+        check("the rescue brought it back on-screen", IsOnSomeScreenPublic);
+        check("the rescue moved it off the stranded spot", Location != stranded);
+
+        // 2. It must land FULLY inside a real work area, not straddling one.
+        Rectangle r = new Rectangle(Location, Size);
+        bool inside = false;
+        foreach (Screen sc in Screen.AllScreens) {
+            Rectangle wa = sc.WorkingArea;
+            if (r.Left >= wa.Left && r.Right <= wa.Right &&
+                r.Top >= wa.Top && r.Bottom <= wa.Bottom) inside = true;
+        }
+        check("the rescued widget sits fully inside a work area", inside);
+
+        // 3. Still reachable -> must not move. This is the standing promise
+        //    that only an unreachable pet is ever relocated.
+        Point before = Location;
+        ForceDisplayChangeForTest();
+        check("a reachable widget is left exactly where it was", Location == before);
+
+        // 4. The nearest-screen pick, against synthetic monitors (primary,
+        //    one to the right, one to the left).
+        Rectangle[] syn = new Rectangle[] {
+            new Rectangle(0, 0, 1920, 1040),
+            new Rectangle(1920, 0, 1280, 1024),
+            new Rectangle(-1600, 0, 1600, 900)
+        };
+        check("nearest pick: far right -> the right-hand screen",
+              NearestScreenIndexPublic(syn, new Rectangle(5000, 100, 100, 100)) == 1);
+        check("nearest pick: far left -> the left-hand screen",
+              NearestScreenIndexPublic(syn, new Rectangle(-4000, 100, 100, 100)) == 2);
+        check("nearest pick: inside the primary -> the primary",
+              NearestScreenIndexPublic(syn, new Rectangle(100, 100, 100, 100)) == 0);
+        check("nearest pick: just past the right screen -> that screen",
+              NearestScreenIndexPublic(syn, new Rectangle(3210, 100, 10, 10)) == 1);
+
+        // 5. The watchdog ALONE - no display-change notice sent at all. This is
+        //    the real guarantee for the case the notice never arrives, or
+        //    arrives before the new topology is live (the classmate's report).
+        PumpTicks(60);                       // drain any burst case 3 left armed
+        Point stranded2 = new Point(vd.Right + 2000, vd.Bottom + 300);
+        Location = stranded2;
+        check("stranded again with no notice sent", !IsOnSomeScreenPublic);
+        PumpTicks(220);                      // idle ticks well past the 5s cadence
+        check("the watchdog alone brought it back", IsOnSomeScreenPublic);
+        check("the watchdog moved it off the stranded spot", Location != stranded2);
+
+        // 6. ...and it must be idle, not twitchy: a reachable pet is never
+        //    nudged by the backstop, no matter how long it runs.
+        Point keep = Location;
+        PumpTicks(300);
+        check("the idle watchdog never moves a reachable widget", Location == keep);
+
+        // 7. The watchdog stands down during a drag. Yanking the pet out of the
+        //    user's hand mid-gesture would be worse than the bug being fixed.
+        SetDragForTest(true);
+        Point dragged = new Point(vd.Right + 2500, vd.Bottom + 400);
+        Location = dragged;
+        PumpTicks(300);                      // well past both cadences
+        check("the watchdog stands down while a drag is in progress",
+              Location == dragged);
+        SetDragForTest(false);
+        PumpTicks(220);                      // released -> now it may act
+        check("the watchdog takes over again once the drag ends",
+              IsOnSomeScreenPublic);
+
+        Console.WriteLine("\nrescuetest: " + pass + " passed, " + fail + " failed");
+    }
+
+    // --pickertest: the reopen bug in one place. Each NumPicker is handed a
+    // value the way SettingsDialog hands it one, then asked what it now shows.
+    // A picker that ignores its initial value reports the first preset; these
+    // assertions pin the echo behaviour for good.
+    public void RunPickerTest() {
+        Console.WriteLine("numeric picker reopen regression (--pickertest)");
+        int pass = 0, fail = 0;
+
+        Action<string, bool> check = delegate (string name, bool ok) {
+            Console.WriteLine("  " + (ok ? "PASS  " : "FAIL  ") + name);
+            if (ok) pass++; else fail++;
+        };
+
+        // Values chosen to exercise both branches: an exact preset hit, a value
+        // between presets (must land in the editor as 自定义), and the extremes.
+        double[] sizes = SettingsDialog.SizePresets;
+        double[] steps = SettingsDialog.Steps;
+        double[] floats = SettingsDialog.FloatPresets;
+
+        // 1. exact preset (step 5 is in the list): the combo carries it, the
+        //    editor stays on the placeholder rather than echoing the number.
+        {
+            NumPicker p = new NumPicker("自定义...", SettingsDialog.NUM_MIN,
+                                        SettingsDialog.STEP_MAX, 5.0);
+            p.SetPresets(steps, FmtFor);
+            check("step=5 -> combo picks the 5 row, box keeps the placeholder",
+                  p.ShownValue() == 5.0 && !p.IsCustomShown && p.IsShowingPlaceholder);
+        }
+        // 2. saved value that is NOT a preset (the real-world state.ini case)
+        {
+            NumPicker p = new NumPicker("自定义...", SettingsDialog.NUM_MIN,
+                                        SettingsDialog.STEP_MAX, 3.25);
+            p.SetPresets(steps, FmtFor);
+            check("step=3.25 -> box shows 3.25, combo on 自定义",
+                  Math.Abs(p.ShownValue() - 3.25) < 1e-9 && p.IsCustomShown);
+        }
+        // 3. size at a preset
+        {
+            NumPicker p = new NumPicker("自定义...", SettingsDialog.NUM_MIN,
+                                        SettingsDialog.SIZE_MAX_CM, 6.0);
+            p.SetPresets(sizes, CmFor);
+            check("size=6 -> combo picks the 6cm row, box keeps the placeholder",
+                  Math.Abs(p.ShownValue() - 6.0) < 1e-9 && !p.IsCustomShown &&
+                  p.IsShowingPlaceholder);
+        }
+        // 4. floater at a preset
+        {
+            NumPicker p = new NumPicker("自定义...", SettingsDialog.NUM_MIN,
+                                        SettingsDialog.FLOAT_MAX, 3.0);
+            p.SetPresets(floats, delegate (double v) { return FmtFor(v) + " \u500D"; });
+            check("floatmult=3 -> combo picks the 3x row, box keeps the placeholder",
+                  Math.Abs(p.ShownValue() - 3.0) < 1e-9 && !p.IsCustomShown &&
+                  p.IsShowingPlaceholder);
+        }
+        // 5/6/7. limits are per-row - both floor and ceiling
+        check("size range is 0.5..20",
+              Math.Abs(SettingsDialog.SIZE_MIN_CM - 0.5) < 1e-9 &&
+              Math.Abs(SettingsDialog.SIZE_MAX_CM - 20.0) < 1e-9);
+        check("float range is 0.5..10",
+              Math.Abs(SettingsDialog.FLOAT_MIN - 0.5) < 1e-9 &&
+              Math.Abs(SettingsDialog.FLOAT_MAX - 10.0) < 1e-9);
+        check("step range is 0.01..999.99",
+              Math.Abs(SettingsDialog.STEP_MIN - 0.01) < 1e-9 &&
+              Math.Abs(SettingsDialog.STEP_MAX - 999.99) < 1e-9);
+        check("every floor sits below its own ceiling",
+              SettingsDialog.SIZE_MIN_CM < SettingsDialog.SIZE_MAX_CM &&
+              SettingsDialog.FLOAT_MIN   < SettingsDialog.FLOAT_MAX &&
+              SettingsDialog.STEP_MIN    < SettingsDialog.STEP_MAX);
+
+        // The 1.5cm preset was removed on request (2026-10-13).
+        {
+            bool has15 = false;
+            foreach (double v in sizes) if (Math.Abs(v - 1.5) < 1e-9) has15 = true;
+            check("size preset list no longer offers 1.5cm", !has15);
+        }
+
+        // 8/9/10. the integer-digit cap tracks each ceiling
+        {
+            NumPicker sz = new NumPicker("自定义...", SettingsDialog.SIZE_MIN_CM,
+                                         SettingsDialog.SIZE_MAX_CM, 1.5);
+            sz.SetPresets(sizes, CmFor);
+            check("size admits '20' but not '200'", sz.AcceptsDigits("20") && !sz.AcceptsDigits("200"));
+
+            NumPicker fl = new NumPicker("自定义...", SettingsDialog.FLOAT_MIN,
+                                         SettingsDialog.FLOAT_MAX, 1.0);
+            fl.SetPresets(floats, delegate (double v) { return FmtFor(v) + " \u500D"; });
+            check("float admits '10' but not '100'", fl.AcceptsDigits("10") && !fl.AcceptsDigits("100"));
+
+            NumPicker st = new NumPicker("自定义...", SettingsDialog.STEP_MIN,
+                                         SettingsDialog.STEP_MAX, 1.0);
+            st.SetPresets(steps, FmtFor);
+            check("step admits '999' but not '1000'", st.AcceptsDigits("999") && !st.AcceptsDigits("1000"));
+        }
+
+        // 11. two decimals, no more
+        {
+            NumPicker p = new NumPicker("自定义...", SettingsDialog.NUM_MIN,
+                                        SettingsDialog.STEP_MAX, 1.0);
+            p.SetPresets(steps, FmtFor);
+            check("only two decimals survive a keystroke sequence",
+                  p.AcceptsDigits("3.25") && !p.AcceptsDigits("3.256"));
+        }
+
+        // 12/13. a value typed below the floor is clamped up on commit, so a
+        // half-typed "0.1" (on the way to "0.5") can never leave the row
+        // holding something the pet would reject.
+        {
+            NumPicker sz = new NumPicker("自定义...", SettingsDialog.SIZE_MIN_CM,
+                                         SettingsDialog.SIZE_MAX_CM, 1.5);
+            sz.SetPresets(sizes, CmFor);
+            check("size typed 0.1 clamps up to 0.5",
+                  Math.Abs(sz.CommitValue(0.1) - 0.5) < 1e-9);
+
+            NumPicker st = new NumPicker("自定义...", SettingsDialog.STEP_MIN,
+                                         SettingsDialog.STEP_MAX, 1.0);
+            st.SetPresets(steps, FmtFor);
+            check("step typed 0.001 clamps up to 0.01",
+                  Math.Abs(st.CommitValue(0.001) - 0.01) < 1e-9);
+        }
+
+        Console.WriteLine("\npickertest: " + pass + " passed, " + fail + " failed");
+    }
+
     // --abouttest: mechanical proof of the things a screenshot cannot show.
     public void RunAboutTest() {
         Console.WriteLine("about menu regression (--abouttest)");
 
         int n = _menu.Items.Count;
-        int aboutIdx = -1, quitIdx = -1;
+        int aboutIdx = -1, quitIdx = -1, settingsIdx = -1;
         for (int i = 0; i < n; i++) {
             ToolStripMenuItem mi = _menu.Items[i] as ToolStripMenuItem;
             if (mi == null) continue;
             if (mi.Text == S_ABOUT) aboutIdx = i;
             if (mi.Text == S_QUIT) quitIdx = i;
+            if (mi.Text == S_SETTINGS) settingsIdx = i;
         }
         Console.WriteLine("  menu items      = " + n);
+        Console.WriteLine("  Settings index  = " + settingsIdx);
         Console.WriteLine("  About index     = " + aboutIdx);
         Console.WriteLine("  Quit index      = " + quitIdx);
 
         bool secondToLast = (aboutIdx >= 0) && (quitIdx == n - 1) && (aboutIdx == n - 2);
         Console.WriteLine("  AboutIsSecondToLast=" + secondToLast);
+        // The menu is actions-only since 1.2.19. Settings must sit directly
+        // above About (asked 2026-10-13), so a future reshuffle breaks here
+        // rather than in a screenshot nobody diffs.
+        bool settingsAboveAbout = (settingsIdx >= 0) && (settingsIdx == aboutIdx - 1);
+        Console.WriteLine("  SettingsAboveAbout=" + settingsAboveAbout);
 
         string body = AboutBody();
         int lines = body.Split('\n').Length;
@@ -2019,6 +3056,7 @@ public sealed class WbPet : Form {
         string expectVer = AboutVersion();
         bool verOk = expectVer != "?" && body.IndexOf("WorkBuddy PointPal " + expectVer) >= 0;
         bool ok = secondToLast &&
+                  settingsAboveAbout &&
                   verOk &&
                   body.IndexOf("Realfie") >= 0 &&
                   body.IndexOf(_baseDir) >= 0 &&
@@ -2030,16 +3068,21 @@ public sealed class WbPet : Form {
     void AskLabel() {
         using (InputDialog d = new InputDialog(S_LBLT, S_LBLP, "", _label)) {
             if (d.ShowDialog(this) != DialogResult.OK) return;
-            string v = d.Value;
-            if (v.Length > 0 && v != _label) {
-                _label = v;
-                SaveState();
-                _dirty = true;
-                RenderToCanvas();
-                PushLayer();
-                Log("label set to '" + v + "'");
-            }
+            SetLabel(d.Value);
         }
+    }
+
+    // Shared by AskLabel and the settings dialog's label box. An empty value is
+    // refused, so the tablet's first line can never go blank by accident.
+    void SetLabel(string v) {
+        v = (v ?? "").Trim();
+        if (v.Length == 0 || v == _label) return;
+        _label = v;
+        SaveState();
+        _dirty = true;
+        RenderToCanvas();
+        PushLayer();
+        Log("label set to '" + v + "'");
     }
 
     // ------------------------------------------------------------ characters ---
@@ -2107,6 +3150,8 @@ public sealed class WbPet : Form {
     }
 
     void SetFloatMult(double v) {
+        // Matches SettingsDialog.FLOAT_MIN / FLOAT_MAX: the floater row
+        // offers 0.5-10x.
         if (v < 0.5) v = 0.5;
         if (v > 10) v = 10;
         if (Math.Abs(v - _floatMult) < 1e-9) return;
@@ -2137,7 +3182,7 @@ public sealed class WbPet : Form {
             string sndPath = Path.Combine(_baseDir, Get("WBPET_SOUND_FILE", "hit.mp3"));
             if (File.Exists(sndPath)) {
                 int vol = int.Parse(Get("WBPET_VOLUME", "80"));
-                _sound = new SoundPool(sndPath, 4, vol, Path.Combine(_baseDir, "pet.log"));
+                _sound = new SoundPool(sndPath, 4, vol, LogFileIn(_baseDir));
                 if (_sound.Failed) { Log("sound pool failed: " + _sound.Error); _soundEnabled = false; }
             }
         }
@@ -2145,9 +3190,24 @@ public sealed class WbPet : Form {
         Log("hit sound " + (_soundWanted ? "on" : "off"));
     }
 
+    // "启动落点" setting, chosen in the settings dialog. Remembering takes
+    // effect on the NEXT launch: the widget is not moved now, because the user
+    // explicitly asked that a chosen corner stays where it is (2026-10-13).
+    void SetRememberScreen(bool on) {
+        if (on == _rememberScreen) return;
+        _rememberScreen = on;
+        // Turning remembering on while parked somewhere records that spot, so
+        // the promise "come back here" is about the place the user can see.
+        if (on) SavePos();
+        SaveState();
+        Log("startup position mode = " + (on ? "remember this screen" : "always primary"));
+    }
+
     void SetCm(double v) {
-        if (v < 0.8) v = 0.8;
-        if (v > 40) v = 40;
+        // Matches SettingsDialog.SIZE_MIN_CM / SIZE_MAX_CM: the size row
+        // offers 0.5-20cm.
+        if (v < 0.5) v = 0.5;
+        if (v > 20) v = 20;
         _cm = v;
         Relayout();
         SnapToCorner(true);               // keep it pinned to the corner
@@ -2299,32 +3359,232 @@ public sealed class WbPet : Form {
         return dst;
     }
 
+    // The working area the widget is allowed to snap into. Until 1.2.19 this
+    // was hardcoded to Screen.PrimaryScreen, so the pet fled back to the main
+    // monitor no matter where it was dropped - a bug on any multi-monitor
+    // desk (reported 2026-10-13). The rule now: the area of the screen the
+    // widget currently sits on. On a single-monitor machine FromRectangle
+    // returns the primary screen, so nothing changes there.
+    Rectangle SnapArea() {
+        try { return Screen.FromRectangle(Bounds).WorkingArea; }
+        catch { return Screen.PrimaryScreen.WorkingArea; }
+    }
+
+    // Anchors a point into a work area without knowing the widget size, so the
+    // pick-a-corner rule can be unit-tested against synthetic monitors (see
+    // --monitortest). Pure: no fields, no Screen calls.
+    internal static Point CornerIn(Rectangle wa, int w, int h, bool sideRight) {
+        return sideRight
+            ? new Point(wa.Right - w, wa.Bottom - h)
+            : new Point(wa.Left,      wa.Bottom - h);
+    }
+
+    // Which bottom corner a drop point of the widget's centre picks on a given
+    // work area. Pure, for the same reason as CornerIn.
+    internal static bool SideFor(Rectangle wa, int centreX) {
+        return (centreX - wa.Left) * 2 >= wa.Width;
+    }
+
     void SnapToCorner(bool immediate) {
-        Rectangle wa = Screen.PrimaryScreen.WorkingArea;
-        Point target = _sideRight
-            ? new Point(wa.Right - _w, wa.Bottom - _h)
-            : new Point(wa.Left, wa.Bottom - _h);
-        if (immediate) { Location = target; _snapping = false; return; }
+        Point target = CornerIn(SnapArea(), _w, _h, _sideRight);
+        if (immediate) { Location = target; _snapping = false; SavePos(); return; }
         _snapFrom = Location;
         _snapTo = target;
         _snapT = 0;
         _snapping = true;
     }
 
+    // First placement of a session. Two modes (see the "启动落点" setting):
+    //   remember -> rebuild the screen the user last settled on, from the
+    //               anchor offsets, and park in the same corner;
+    //   primary  -> historical behaviour: bottom corner of the primary screen,
+    //               left or right per the saved side.
+    // The remembered screen is matched to a real monitor by work area; if it is
+    // gone (monitor unplugged, resolution changed) the primary screen is used,
+    // so the widget is never placed off-screen.
+    void PlaceOnStartup() {
+        bool wantRemember = _rememberScreen && _anchorValid;
+        if (wantRemember) {
+            Rectangle wa = AnchorToCurrentScreen();
+            if (wa.Width > 0) {
+                Point t = CornerIn(wa, _w, _h, _anchorRight);
+                _sideRight = _anchorRight;
+                Location = t;
+                _snapping = false;
+                SavePos();
+                Log("startup: restored to remembered screen " + wa.X + "," + wa.Y +
+                    " corner=" + (_anchorRight ? "right" : "left"));
+                return;
+            }
+            Log("startup: remembered screen is gone, falling back to the primary");
+        }
+        SnapToCorner(true);
+        Log("startup: placed on the primary screen (remember=" + _rememberScreen +
+            ", anchorValid=" + _anchorValid + ")");
+    }
+
+    // Maps the stored anchor onto whichever current monitor best matches it.
+    // Preference order: exact work area, then an equal-size monitor whose
+    // position moved, then same-size fallback by index. Empty rectangle = no
+    // candidate (single-monitor desks, or the screen went away).
+    Rectangle AnchorToCurrentScreen() {
+        Rectangle best = Rectangle.Empty;
+        Screen[] all = Screen.AllScreens;
+        // exact match (the common case: nothing changed)
+        foreach (Screen s in all)
+            if (s.WorkingArea == _anchorWa) return s.WorkingArea;
+        // same size, moved: the user rearranged the desk or a panel width changed
+        foreach (Screen s in all)
+            if (s.WorkingArea.Width == _anchorWa.Width &&
+                s.WorkingArea.Height == _anchorWa.Height) {
+                if (s.WorkingArea != _anchorPrimary) return s.WorkingArea;
+                best = s.WorkingArea;   // keep the primary as a last resort
+            }
+        return best;
+    }
+
+    // Only a rescue, never a relocation: if a monitor was unplugged or the
+    // resolution changed under us, the widget can end up parked off-screen
+    // (reported 2026-10-13). Nudge it into the nearest visible corner ONLY in
+    // that case - a deliberate drop on a second monitor is left alone.
+    void RescueIfOffScreen() {
+        if (IsOnSomeScreen()) return;
+        Rectangle wa = RescueArea();
+        Point target = CornerIn(wa, _w, _h, _sideRight);
+        Location = target;
+        _snapping = false;
+        SavePos();
+        // Moving a layered window does not repaint its surface, and after a
+        // mode change the compositor may have dropped ours outright. Re-push
+        // so the pet can never end up "there, but invisible".
+        RenderToCanvas();
+        PushLayer();
+        Log("display change: widget was off-screen, rescued to " + wa.X + "," + wa.Y +
+            " corner=" + (_sideRight ? "right" : "left"));
+    }
+
+    // Where a stranded widget goes: the monitor NEAREST to what is left of it,
+    // falling back to the primary. Deliberately not Screen.FromRectangle -
+    // what that returns for a rectangle intersecting nothing is not something
+    // to build a rescue on.
+    Rectangle RescueArea() {
+        try {
+            Screen[] all = Screen.AllScreens;
+            if (all.Length > 0) {
+                Rectangle[] rs = new Rectangle[all.Length];
+                for (int i = 0; i < all.Length; i++) rs[i] = all[i].Bounds;
+                int k = NearestScreenIndex(rs, Bounds);
+                if (k >= 0) return all[k].WorkingArea;
+            }
+        } catch { }
+        try { return Screen.PrimaryScreen.WorkingArea; } catch { }
+        return SystemInformation.WorkingArea;
+    }
+
+    // Index of the monitor closest to r, measured centre-to-rectangle so a
+    // monitor diagonally away is not preferred over the one right beside it.
+    // Pure: no Screen calls, so the pick is assertable (--rescuetest).
+    internal static int NearestScreenIndex(Rectangle[] screens, Rectangle r) {
+        Point c = new Point(r.Left + r.Width / 2, r.Top + r.Height / 2);
+        int best = -1; long bestD = long.MaxValue;
+        for (int i = 0; i < screens.Length; i++) {
+            Rectangle s = screens[i];
+            int dx = 0, dy = 0;
+            if (c.X < s.Left) dx = s.Left - c.X;
+            else if (c.X >= s.Right) dx = c.X - s.Right + 1;
+            if (c.Y < s.Top) dy = s.Top - c.Y;
+            else if (c.Y >= s.Bottom) dy = c.Y - s.Bottom + 1;
+            long d = (long)dx * dx + (long)dy * dy;
+            if (d < bestD) { bestD = d; best = i; }
+        }
+        return best;
+    }
+
+    // The watchdog, driven off the animation timer so no extra timer exists.
+    // Checks hard for a moment after a display change (the new topology may
+    // not be live the instant the notice arrives), then settles into a slow
+    // idle cadence that costs a few rectangle intersections every 5s.
+    void WatchdogTick() {
+        // Never fight the user's own hand: while a drag is in progress the
+        // widget is exactly where they are putting it.
+        if (_drag) return;
+        double dtms = _timer == null ? 33 : _timer.Interval;
+        if (_rescueBurstLeft > 0) {
+            _rescueBurstLeft -= dtms;
+            RescueIfOffScreen();
+            return;
+        }
+        _watchdogAccum += dtms;
+        if (_watchdogAccum < WATCHDOG_MS) return;
+        _watchdogAccum = 0;
+        RescueIfOffScreen();
+    }
+
+    bool IsOnSomeScreen() {
+        try {
+            Rectangle b = Bounds;
+            foreach (Screen s in Screen.AllScreens) {
+                // A sliver still counts: only "entirely outside every monitor"
+                // is a rescue. Intersecting at all means the user can reach it.
+                if (Rectangle.Intersect(s.Bounds, b).Width > 0 &&
+                    Rectangle.Intersect(s.Bounds, b).Height > 0) return true;
+            }
+            return false;
+        } catch { return true; }
+    }
+
+    // ---- test hooks (--rescuetest) -----------------------------------------
+    public bool IsOnSomeScreenPublic { get { return IsOnSomeScreen(); } }
+    public static int NearestScreenIndexPublic(Rectangle[] screens, Rectangle r) {
+        return NearestScreenIndex(screens, r);
+    }
+    // Exactly what the WndProc does for WM_DISPLAYCHANGE, minus the message.
+    public void ForceDisplayChangeForTest() {
+        _rescueBurstLeft = RESCUE_BURST_MS;
+        RescueIfOffScreen();
+    }
+    public void SetDragForTest(bool on) { _drag = on; }
+
     // --------------------------------------------------------------- state ---
 
-    string StatePath { get { return Path.Combine(_baseDir, "state.ini"); } }
-    string TokenPath { get { return Path.Combine(_baseDir, "token.txt"); } }
+    // Both live in userdata\ now. ReadOld/Resolve below fall back to the old
+    // data-folder-root location so an upgrade in progress is still readable.
+    string StatePath { get { return Path.Combine(_userDir, "state.ini"); } }
+    string TokenPath { get { return Path.Combine(_userDir, "token.txt"); } }
+    string LogPath   { get { return ResolveUserFile(_userDir, _baseDir, "pet.log"); } }
+
+    // Prefer the new (userdata\) copy; fall back to the legacy root copy. A
+    // caller that only wants to READ should use this; writers use the new path
+    // directly (and MigrateUserFiles has already moved any legacy file over).
+    static string ResolveUserFile(string userDir, string baseDir, string name) {
+        try {
+            string nw = Path.Combine(userDir, name);
+            if (File.Exists(nw)) return nw;
+            string old = Path.Combine(baseDir, name);
+            if (File.Exists(old)) return old;
+        } catch { }
+        return Path.Combine(userDir, name);
+    }
+
+    // Users of the data folder may be very old installations whose userdata\
+    // does not exist yet (migration runs at boot, but a writer should never
+    // depend on that having happened).
+    void EnsureUserDir() {
+        try { if (!Directory.Exists(_userDir)) Directory.CreateDirectory(_userDir); } catch { }
+    }
 
     void ReadState() {
         try {
-            if (!File.Exists(StatePath)) return;
-            foreach (string line in File.ReadAllLines(StatePath, Encoding.UTF8)) {
+            // Migration normally already moved it, but read through the resolver
+            // anyway so a read can never miss a legacy file.
+            string path = ResolveUserFile(_userDir, _baseDir, "state.ini");
+            if (!File.Exists(path)) return;
+            foreach (string line in File.ReadAllLines(path, Encoding.UTF8)) {
                 int i = line.IndexOf('=');
                 if (i <= 0) continue;
                 string k = line.Substring(0, i).Trim(), v = line.Substring(i + 1).Trim();
                 double d;
-                if (k == "cm" && double.TryParse(v, NumberStyles.Float, CultureInfo.InvariantCulture, out d) && d >= 0.8)
+                if (k == "cm" && double.TryParse(v, NumberStyles.Float, CultureInfo.InvariantCulture, out d) && d >= 0.5 && d <= 20)
                     _cm = d;
                 else if (k == "step" && double.TryParse(v, NumberStyles.Float, CultureInfo.InvariantCulture, out d) && d >= 0.01)
                     _step = d;
@@ -2334,6 +3594,29 @@ public sealed class WbPet : Form {
                     _char = FindChar(v);
                 else if (k == "side")
                     _sideRight = (v == "right");
+                else if (k == "posmode")
+                    _rememberScreen = (v == "remember");
+                else if (k == "anchor") {
+                    // "dx,dy,dw,dh,px,py,pw,ph,side" - the screen's work area as
+                    // an offset from the primary's top-left, plus the primary's
+                    // size, plus which corner. Offsets (not absolute pixels) so
+                    // a rearranged desk still lands somewhere sensible.
+                    string[] p = v.Split(',');
+                    long[] q = new long[8];
+                    bool good = p.Length == 9;
+                    if (good)
+                        for (int j = 0; j < 8; j++)
+                            good &= long.TryParse(p[j], NumberStyles.Integer,
+                                                  CultureInfo.InvariantCulture, out q[j]);
+                    if (good) {
+                        _anchorWa = new Rectangle(
+                            (int)(q[4] + q[0]), (int)(q[5] + q[1]), (int)q[2], (int)q[3]);
+                        _anchorPrimary = new Rectangle(
+                            (int)q[4], (int)q[5], (int)q[6], (int)q[7]);
+                        _anchorRight = (p[8] == "right");
+                        _anchorValid = true;
+                    }
+                }
                 else if (k == "floatmult" && double.TryParse(v, NumberStyles.Float, CultureInfo.InvariantCulture, out d) && d >= 0.5 && d <= 10)
                     _floatMult = d;
                 else if (k == "sound")
@@ -2344,6 +3627,7 @@ public sealed class WbPet : Form {
 
     void SaveState() {
         try {
+            EnsureUserDir();
             File.WriteAllText(StatePath,
                 "cm=" + _cm.ToString("0.##", CultureInfo.InvariantCulture) + "\r\n" +
                 "step=" + _step.ToString("0.##", CultureInfo.InvariantCulture) + "\r\n" +
@@ -2351,8 +3635,40 @@ public sealed class WbPet : Form {
                 "char=" + _char.Id + "\r\n" +
                 "side=" + (_sideRight ? "right" : "left") + "\r\n" +
                 "floatmult=" + _floatMult.ToString("0.##", CultureInfo.InvariantCulture) + "\r\n" +
-                "sound=" + (_soundWanted ? "1" : "0") + "\r\n",
+                "sound=" + (_soundWanted ? "1" : "0") + "\r\n" +
+                "posmode=" + (_rememberScreen ? "remember" : "primary") + "\r\n" +
+                AnchorLine(),
                 new UTF8Encoding(false));
+        } catch { }
+    }
+
+    // The settled corner, as an offset from the primary screen's top-left (see
+    // the reader in ReadState). Empty until the widget has been placed once.
+    string AnchorLine() {
+        if (!_anchorValid) return "";
+        int dx = _anchorWa.Left - _anchorPrimary.Left;
+        int dy = _anchorWa.Top  - _anchorPrimary.Top;
+        return "anchor=" +
+            dx.ToString(CultureInfo.InvariantCulture) + "," +
+            dy.ToString(CultureInfo.InvariantCulture) + "," +
+            _anchorWa.Width.ToString(CultureInfo.InvariantCulture) + "," +
+            _anchorWa.Height.ToString(CultureInfo.InvariantCulture) + "," +
+            _anchorPrimary.Left.ToString(CultureInfo.InvariantCulture) + "," +
+            _anchorPrimary.Top.ToString(CultureInfo.InvariantCulture) + "," +
+            _anchorPrimary.Width.ToString(CultureInfo.InvariantCulture) + "," +
+            _anchorPrimary.Height.ToString(CultureInfo.InvariantCulture) + "," +
+            (_anchorRight ? "right" : "left") + "\r\n";
+    }
+
+    // Records the corner the widget just settled into. Called from every place
+    // the widget parks itself, so "remember which screen" always reflects the
+    // user's latest choice rather than the launch position.
+    void SavePos() {
+        try {
+            _anchorWa = SnapArea();
+            _anchorPrimary = Screen.PrimaryScreen.WorkingArea;
+            _anchorRight = _sideRight;
+            _anchorValid = true;
         } catch { }
     }
 
@@ -2363,6 +3679,7 @@ public sealed class WbPet : Form {
             return;
         }
         try {
+            EnsureUserDir();
             // line1 = credential, line2 = uid (optional), line3 = User-Agent,
             // sealed with DPAPI under the CURRENT USER before it touches disk.
             // The plaintext used to be written verbatim, so a copied, backed-up
@@ -2438,6 +3755,22 @@ public sealed class WbPet : Form {
             m.Result = (IntPtr)(solid ? Native.HTCLIENT : Native.HTTRANSPARENT);
             return;
         }
+        if (m.Msg == Native.WM_DISPLAYCHANGE) {
+            // A monitor was added/removed or a resolution changed. Deliberately
+            // NOT a re-snap: the user told us a chosen corner stays put (asked
+            // 2026-10-13). We only rescue the widget if the change left it
+            // entirely off-screen, which is a "can't reach it" bug, not a
+            // preference.
+            //
+            // Check now AND for the next moment: this notice can arrive before
+            // the new topology is live, in which case AllScreens still lists
+            // the monitor that just left and a single check sees nothing
+            // wrong. No second notice follows, so one-shot checking left the
+            // pet stranded off-screen for good (reported 2026-10-13).
+            _rescueBurstLeft = RESCUE_BURST_MS;
+            RescueIfOffScreen();
+            PushLayer();
+        }
         base.WndProc(ref m);
     }
 
@@ -2466,11 +3799,14 @@ public sealed class WbPet : Form {
     protected override void OnMouseUp(MouseEventArgs e) {
         if (_drag) {
             _drag = false;
-            // The drop position picks the corner: centre of the widget in the
-            // right half of the screen -> snap bottom-right and mirror the art
-            // so the character faces left; otherwise bottom-left as before.
-            Rectangle wa = Screen.PrimaryScreen.WorkingArea;
-            bool right = (Left + _w / 2 - wa.Left) * 2 >= wa.Width;
+            // The drop picks the corner: the widget's centre relative to the
+            // monitor it was dropped on decides left vs right (bottom either
+            // way). Both the monitor and the split use the DROP position - a
+            // multi-monitor desk used to compare against the primary screen
+            // only, so dropping on a second monitor snapped back to the first
+            // (reported 2026-10-13).
+            Rectangle wa = SnapArea();   // SnapArea uses Bounds, still at the drop point
+            bool right = SideFor(wa, Left + _w / 2);
             SetSide(right, false);        // release -> fly to its corner
         }
         base.OnMouseUp(e);
@@ -2734,6 +4070,7 @@ public sealed class WbPet : Form {
 
     void OnTick() {
         try {
+            WatchdogTick();                  // the pet must never be unreachable
             if (_pollWant != 0) { int want = _pollWant; _pollWant = 0; PollNow(want == 2); }
 
             double dt = _timer.Interval / 1000.0;
@@ -2929,7 +4266,7 @@ public sealed class WbPet : Form {
                 return null;
             }
             int vol = int.Parse(Get("WBPET_VOLUME", "80"));
-            _soundEgg = new SoundPool(p, 4, vol, Path.Combine(_baseDir, "pet.log"));
+            _soundEgg = new SoundPool(p, 4, vol, LogFileIn(_baseDir));
             if (_soundEgg.Failed) { Log("egg sound pool failed: " + _soundEgg.Error); return null; }
             // The amount is logged because this pool is now opened on demand:
             // the line is the only evidence of which charge asked for it, and
@@ -3332,7 +4669,8 @@ public sealed class WbPet : Form {
 
     void Log(string msg) {
         try {
-            File.AppendAllText(Path.Combine(_baseDir, "pet.log"),
+            EnsureUserDir();
+            File.AppendAllText(Path.Combine(_userDir, "pet.log"),
                 DateTime.Now.ToString("s") + " " + msg + "\r\n");
         } catch { }
     }
@@ -3343,6 +4681,16 @@ public sealed class WbPet : Form {
     public static void Run(string baseDir, string[] args) {
         try { Native.SetProcessDpiAwarenessContext(new IntPtr(-4)); }
         catch { try { Native.SetProcessDPIAware(); } catch { } }
+
+        // A rendering self-check starts from an empty shots\ folder: the last
+        // run's PNGs are stale, and keeping them made "which build drew this?"
+        // unanswerable. Done before any window is built, so it also covers the
+        // case where the run dies halfway and leaves a partial set behind.
+        string shotsDir = Path.Combine(baseDir, ShotsSubdir);
+        if (WantsSheets(args)) {
+            ClearShots(shotsDir);
+            try { Directory.CreateDirectory(shotsDir); } catch { }
+        }
 
         bool selftest = Array.IndexOf(args, "--selftest") >= 0;
         bool shot = Array.IndexOf(args, "--shot") >= 0;
@@ -3389,7 +4737,7 @@ public sealed class WbPet : Form {
                 pet.PumpTicks(6);                    // first cue lands
                 pet.PumpTicks(6);                    // second, 0.2s later
                 pet.PumpTicks(6);                    // third
-                pet.SaveCanvas(Path.Combine(baseDir, "_shot_cascade.png"));
+                pet.SaveCanvas(Path.Combine(pet.ShotsDir, "_shot_cascade.png"));
                 Console.WriteLine("cascade: " + pet.ShakeReport() +
                                   "  floaters=" + pet.FloaterCountPublic +
                                   "  printed=" + pet.DrawnText);
@@ -3400,12 +4748,12 @@ public sealed class WbPet : Form {
                 pet.MakeTick(pet.StepValue, true);   // rehearsal for the screenshot
                 pet.BurnFrames(2);
                 Console.WriteLine("shake1: " + pet.ShakeReport());
-                pet.SaveCanvas(Path.Combine(baseDir, "_shot_flash.png"));
+                pet.SaveCanvas(Path.Combine(pet.ShotsDir, "_shot_flash.png"));
                 pet.BurnFrames(3);
                 Console.WriteLine("shake2: " + pet.ShakeReport());
                 pet.BurnFrames(9);
                 Console.WriteLine("after : " + pet.ShakeReport());
-                pet.SaveCanvas(Path.Combine(baseDir, "shot.png"));
+                pet.SaveCanvas(Path.Combine(pet.ShotsDir, "shot.png"));
                 Console.WriteLine("shot ok: connected=" + pet._connected +
                                   " drawn=" + pet.DrawnText);
 
@@ -3416,21 +4764,21 @@ public sealed class WbPet : Form {
                 pet.SetSide(true, true);
                 pet.MakeTick(pet.StepValue, true);
                 pet.BurnFrames(2);
-                pet.SaveCanvas(Path.Combine(baseDir, "_shot_right.png"));
+                pet.SaveCanvas(Path.Combine(pet.ShotsDir, "_shot_right.png"));
                 Console.WriteLine("right: " + pet.ShakeReport() + " canvas=" + pet._w + "x" + pet._h);
                 pet.SetCharacter("claude");
                 pet.SetSide(false, true);
                 pet.BurnFrames(2);
-                pet.SaveCanvas(Path.Combine(baseDir, "_shot_claude_left.png"));
+                pet.SaveCanvas(Path.Combine(pet.ShotsDir, "_shot_claude_left.png"));
                 Console.WriteLine("claude-left: " + pet.ShakeReport() + " canvas=" + pet._w + "x" + pet._h);
                 pet.SetSide(true, true);
                 pet.BurnFrames(2);
-                pet.SaveCanvas(Path.Combine(baseDir, "_shot_claude_right.png"));
+                pet.SaveCanvas(Path.Combine(pet.ShotsDir, "_shot_claude_right.png"));
                 Console.WriteLine("claude-right: " + pet.ShakeReport() + " canvas=" + pet._w + "x" + pet._h);
                 pet.SetCharacter("claude-detailed");
                 pet.SetSide(false, true);
                 pet.BurnFrames(2);
-                pet.SaveCanvas(Path.Combine(baseDir, "_shot_detailed.png"));
+                pet.SaveCanvas(Path.Combine(pet.ShotsDir, "_shot_detailed.png"));
                 Console.WriteLine("detailed-left: " + pet.ShakeReport() + " canvas=" + pet._w + "x" + pet._h);
                 pet.SetCharacter(prevChar);
                 pet.SetSide(prevRight, true);
@@ -3559,9 +4907,44 @@ public sealed class WbPet : Form {
         // so the wording is reviewable offline.
         int updSheetIdx = Array.IndexOf(args, "--updsheet");
         if (updSheetIdx >= 0) {
-            string dir = (updSheetIdx + 1 < args.Length) ? args[updSheetIdx + 1] : ".";
+            string arg = (updSheetIdx + 1 < args.Length) ? args[updSheetIdx + 1] : "";
+            string dir = WbPet.ResolveSheetDir(pet.ShotsDir, arg);
             pet.GoOffline();
             pet.SaveUpdateSheet(dir);
+            Application.Exit();
+            return;
+        }
+
+        // --setsheet <dir>: render every tab of the settings dialog (a window
+        // otherwise only reachable by right-clicking the pet), so its layout is
+        // reviewable offline at the real DPI.
+        int setSheetIdx = Array.IndexOf(args, "--setsheet");
+        if (setSheetIdx >= 0) {
+            string arg = (setSheetIdx + 1 < args.Length) ? args[setSheetIdx + 1] : "";
+            string dir = WbPet.ResolveSheetDir(pet.ShotsDir, arg);
+            pet.GoOffline();
+            pet.SaveSettingsSheet(dir);
+            Application.Exit();
+            return;
+        }
+
+        // --pickertest: prove a NumPicker reopens on the value it was given
+        // rather than falling back to its first preset (the "settings reset
+        // themselves" bug, 2026-10-13). Headless: builds the pickers only.
+        if (Array.IndexOf(args, "--pickertest") >= 0) {
+            pet.GoOffline();
+            pet.RunPickerTest();
+            Application.Exit();
+            return;
+        }
+
+        // --rescuetest: the "pet vanished when the cable was pulled" report
+        // (2026-10-13). Recreates the geometry of a monitor disappearing and
+        // proves the rescue brings the widget back onto a real screen - while
+        // a widget that is still reachable is NOT moved.
+        if (Array.IndexOf(args, "--rescuetest") >= 0) {
+            pet.GoOffline();
+            pet.RunRescueTest();
             Application.Exit();
             return;
         }
@@ -3570,7 +4953,8 @@ public sealed class WbPet : Form {
         // now, not a MessageBox), so its layout is reviewable headlessly.
         int sheetIdx = Array.IndexOf(args, "--aboutsheet");
         if (sheetIdx >= 0) {
-            string dst = (sheetIdx + 1 < args.Length) ? args[sheetIdx + 1] : "aboutsheet.png";
+            string dst = WbPet.ResolveShot(pet.ShotsDir,
+                (sheetIdx + 1 < args.Length) ? args[sheetIdx + 1] : "", "aboutsheet.png");
             pet.GoOffline();
             pet.SaveAboutSheet(dst);
             Application.Exit();
@@ -3582,7 +4966,8 @@ public sealed class WbPet : Form {
         // captions and note line are worth checking on the shipped binary.
         int foundIdx = Array.IndexOf(args, "--updfound");
         if (foundIdx >= 0) {
-            string dst = (foundIdx + 1 < args.Length) ? args[foundIdx + 1] : "updfound.png";
+            string dst = WbPet.ResolveShot(pet.ShotsDir,
+                (foundIdx + 1 < args.Length) ? args[foundIdx + 1] : "", "updfound.png");
             pet.GoOffline();
             pet.SaveUpdateFoundSheet(dst);
             Application.Exit();
@@ -3594,7 +4979,8 @@ public sealed class WbPet : Form {
         // at the real DPI without clicking through a modal dialog.
         int tokIdx = Array.IndexOf(args, "--toksheet");
         if (tokIdx >= 0) {
-            string dst = (tokIdx + 1 < args.Length) ? args[tokIdx + 1] : "toksheet.png";
+            string dst = WbPet.ResolveShot(pet.ShotsDir,
+                (tokIdx + 1 < args.Length) ? args[tokIdx + 1] : "", "toksheet.png");
             pet.GoOffline();
             pet.SaveTokenSheet(dst);
             Application.Exit();
@@ -3870,7 +5256,7 @@ public sealed class WbPet : Form {
         MakeTick(_step, false);
         for (int i = 0; i < 6; i++) OnTick();
         RenderToCanvas();
-        SaveCanvas(Path.Combine(baseDir, "selftest.png"));
+        SaveCanvas(Path.Combine(_shotsDir, "selftest.png"));
         Console.WriteLine("selftest.png written; connected=" + _connected +
                           " drawn=" + DrawnText + " lastPoll=" + _lastPollResult);
     }
@@ -3919,10 +5305,18 @@ public sealed class WbPet : Form {
         // SetToken(), which persists via SaveToken(). A run therefore REPLACED the
         // live token.txt with the CK fixture and left the widget on 401. The file
         // must come out byte-identical; _suppressSave is what guarantees it.
-        string tokPath = TokenPath;
-        bool tokHad = File.Exists(tokPath);
+        // Both candidate locations are watched: on a not-yet-migrated install the
+        // live file is still in the data folder root.
+        string[] tokPaths = new string[] {
+            TokenPath, Path.Combine(_baseDir, "token.txt")
+        };
+        string tokPath = tokPaths[0];
+        bool tokHad = false;
+        for (int i = 0; i < tokPaths.Length; i++) {
+            if (File.Exists(tokPaths[i])) { tokPath = tokPaths[i]; tokHad = true; break; }
+        }
         string tokBefore = tokHad ? HashFile(tokPath) : "";
-        Console.WriteLine("  guard: live token.txt " + (tokHad ? "present, will verify unchanged" : "absent, will verify still absent"));
+        Console.WriteLine("  guard: live token.txt " + (tokHad ? "present at " + tokPath + ", will verify unchanged" : "absent, will verify still absent"));
 
         // the exact shape that failed: one line, single quotes, extra -H in front
         chk("chrome copy-as-cURL, one line", 
@@ -4191,18 +5585,16 @@ public sealed class WbPet : Form {
         }
         Console.WriteLine("  routing ok=" + ok + " bad=" + bad);
 
-        // The egg steps must NOT be listed in the menu - that would put the
-        // easter egg on display, and the whole point is discovery. They are
-        // still reachable by typing the value into "custom", which is the
-        // intended path. Count them so a future re-add is caught here.
+        // The egg steps must NOT be offered in the step picker - that would put
+        // the easter egg on display, and the whole point is discovery. They are
+        // still reachable by any path that sets the value directly (an old
+        // state.ini, WBPET_STEP, --eggsoundlive), which is the intended route.
+        // Since 1.2.19 the picker is the settings dialog's preset array rather
+        // than a menu submenu, so the assertion reads THAT list.
         int inMenu = 0, menuSteps = 0;
-        foreach (ToolStripItem it in _stepItem.DropDownItems) {
-            double d;
-            if (it is ToolStripMenuItem && double.TryParse(((ToolStripMenuItem)it).Text,
-                    NumberStyles.Float, CultureInfo.InvariantCulture, out d)) {
-                menuSteps++;
-                if (IsEggStep(d)) inMenu++;
-            }
+        foreach (double v in SettingsDialog.Steps) {
+            menuSteps++;
+            if (IsEggStep(v)) inMenu++;
         }
         Console.WriteLine("  eggStepsInMenu=" + inMenu + " (expect 0: kept hidden)");
         if (inMenu != 0) bad++;
@@ -4310,7 +5702,7 @@ public sealed class WbPet : Form {
         if (!File.Exists(snd)) { Console.WriteLine("  abort: no sound file"); Environment.ExitCode = 1; return; }
 
         int vol = 80;
-        SoundPool pool = new SoundPool(snd, 4, vol, Path.Combine(baseDir, "pet.log"));
+        SoundPool pool = new SoundPool(snd, 4, vol, LogFileIn(baseDir));
         Console.WriteLine("  open   : failed=" + pool.Failed + " err=" + pool.Error);
         Console.WriteLine("  mode after open : " + pool.DebugModes());
         if (pool.Failed) {
@@ -4364,7 +5756,7 @@ public sealed class WbPet : Form {
         Console.WriteLine("  rhythm: " + CueGapSec.ToString("0.#") + "s   cues: " + cues);
         if (!File.Exists(snd)) { Console.WriteLine("  abort: no sound file"); Environment.ExitCode = 1; return; }
 
-        SoundPool pool = new SoundPool(snd, 4, 80, Path.Combine(baseDir, "pet.log"));
+        SoundPool pool = new SoundPool(snd, 4, 80, LogFileIn(baseDir));
         Console.WriteLine("  open  : failed=" + pool.Failed + " err=" + pool.Error);
         if (pool.Failed) { Console.WriteLine("  abort: pool could not open"); Environment.ExitCode = 1; return; }
 
@@ -4416,7 +5808,7 @@ public sealed class WbPet : Form {
         };
         int rounds = names.Length;
         for (int r = 0; r < rounds; r++) {
-            SoundPool pool = new SoundPool(snd, 4, 80, Path.Combine(baseDir, "pet.log"));
+            SoundPool pool = new SoundPool(snd, 4, 80, LogFileIn(baseDir));
             if (pool.Failed) { Console.WriteLine("  [" + names[r] + "] open failed: " + pool.Error); continue; }
             int played = 0, cut = 0;
             int gapMs = (int)Math.Round(CueGapSec * 1000);
@@ -4445,7 +5837,7 @@ public sealed class WbPet : Form {
         // the real-world race and the A/B result above is uninformative.
         Console.WriteLine();
         Console.WriteLine("  transition timing (one alias):");
-        SoundPool tp = new SoundPool(snd, 4, 80, Path.Combine(baseDir, "pet.log"));
+        SoundPool tp = new SoundPool(snd, 4, 80, LogFileIn(baseDir));
         if (!tp.Failed) {
             int s = tp.Play();
             if (s >= 0) {
@@ -4473,7 +5865,15 @@ public sealed class WbPet : Form {
         }
     }
 
+    // Where the rendering test modes put their PNGs. Public so Run() can hand
+    // it to the screenshot paths without duplicating the rule.
+    public string ShotsDir { get { return _shotsDir; } }
+
     public void SaveCanvas(string path) {
+        try {
+            string dir = Path.GetDirectoryName(path);
+            if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir)) Directory.CreateDirectory(dir);
+        } catch { }
         using (Bitmap copy = new Bitmap(_canvas.Width, _canvas.Height, PixelFormat.Format32bppArgb)) {
             using (Graphics g = Graphics.FromImage(copy)) g.DrawImageUnscaled(_canvas, 0, 0);
             using (Bitmap flat = new Bitmap(copy.Width, copy.Height)) {
@@ -4596,11 +5996,13 @@ public static class ExeEntry {
     }
 
     // wb-path.txt holds full paths, one per line; the first one that exists
-    // wins. It is looked for in the data folder (writable without admin) and
-    // next to this exe, which is where the retired .vbs expected it.
+    // wins. It is looked for in userdata\ (writable without admin), then in the
+    // old data-folder root, and finally next to this exe, which is where the
+    // retired .vbs expected it.
     static string WbFromOverride() {
         string dataDir = ExeDataDir(), exeDir = ThisExeDir();
         string[] spots = new string[] {
+            dataDir.Length == 0 ? "" : Path.Combine(dataDir, WbPet.UserSubdir, "wb-path.txt"),
             dataDir.Length == 0 ? "" : Path.Combine(dataDir, "wb-path.txt"),
             exeDir.Length == 0 ? "" : Path.Combine(exeDir, "wb-path.txt")
         };
@@ -4778,13 +6180,15 @@ public static class ExeEntry {
         try {
             MigrateOldDataDir(localApp, baseDir);
             Directory.CreateDirectory(baseDir);
+            MigrateUserFiles(baseDir);
             ExtractResources(baseDir);
             BootCredentials(baseDir);
             if (wantWb) LaunchWorkBuddy();
             WbPet.Run(baseDir, args);
         } catch (Exception ex) {
             try {
-                File.WriteAllText(Path.Combine(baseDir, "error.log"), ex.ToString(),
+                EnsureUserDirs(baseDir);
+                File.WriteAllText(Path.Combine(baseDir, WbPet.UserSubdir, "error.log"), ex.ToString(),
                                   new UTF8Encoding(false));
             } catch { }
             MessageBox.Show(ex.Message, "WorkBuddy PointPal",
@@ -4811,6 +6215,48 @@ public static class ExeEntry {
                 string src = Path.Combine(oldDir, f);
                 string dst = Path.Combine(baseDir, f);
                 if (File.Exists(src) && !File.Exists(dst)) File.Copy(src, dst);
+            }
+        } catch { }
+    }
+
+    // Create the two subfolders the pet writes into. Cheap and idempotent;
+    // callers that WRITE use it rather than trusting the migration to have run.
+    static void EnsureUserDirs(string baseDir) {
+        try {
+            foreach (string sub in new string[] { WbPet.UserSubdir, WbPet.ShotsSubdir }) {
+                string d = Path.Combine(baseDir, sub);
+                if (!Directory.Exists(d)) Directory.CreateDirectory(d);
+            }
+        } catch { }
+    }
+
+    // Files that used to sit in the data folder root now live in userdata\.
+    // A MOVE (not a copy) so nothing is left behind in the root, and the move
+    // only happens when the new location is still empty - a user who has
+    // already run the new build keeps the newer file rather than having a stale
+    // root copy clobber it.
+    static void MigrateUserFiles(string baseDir) {
+        try {
+            string userDir = Path.Combine(baseDir, WbPet.UserSubdir);
+            bool any = false;
+            foreach (string f in WbPet.UserFiles) {
+                if (File.Exists(Path.Combine(baseDir, f))) { any = true; break; }
+            }
+            if (!any) return;
+            if (!Directory.Exists(userDir)) Directory.CreateDirectory(userDir);
+            foreach (string f in WbPet.UserFiles) {
+                string src = Path.Combine(baseDir, f);
+                string dst = Path.Combine(userDir, f);
+                try {
+                    if (!File.Exists(src)) continue;
+                    if (File.Exists(dst)) {
+                        // Both exist: the new-location copy is the live one.
+                        // Drop the stale root copy so the folder stays clean.
+                        try { File.Delete(src); } catch { }
+                        continue;
+                    }
+                    File.Move(src, dst);
+                } catch { }
             }
         } catch { }
     }
@@ -5015,7 +6461,11 @@ public static class ExeEntry {
     static void BootCredentials(string baseDir) {
         try {
             if (Environment.GetEnvironmentVariable("WBPET_TOKEN") != null) return;
-            string tf = Path.Combine(baseDir, "token.txt");
+            // New location first, then the pre-userdata\ one, so an install that
+            // has not migrated yet still logs in.
+            string userDir = Path.Combine(baseDir, WbPet.UserSubdir);
+            string tf = Path.Combine(userDir, "token.txt");
+            if (!File.Exists(tf)) tf = Path.Combine(baseDir, "token.txt");
             if (!File.Exists(tf)) return;
             string[] lines = ReadCredentialLines(tf);
             if (lines == null) return;
