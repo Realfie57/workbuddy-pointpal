@@ -40,8 +40,8 @@ public static class PointPalSetup {
     // Version is what people READ (Apps & features, file names). VersionCore is
     // the numeric form the assembly metadata and any numeric consumer needs -
     // "zc" is not a number and would make the assembly unloadable.
-    public const string VersionCore = "1.2.19.0";
-    public const string Version   = "1.2.19";
+    public const string VersionCore = "1.2.19.5";
+    public const string Version   = "1.2.19.5";
     public const string Publisher = "Realfie";
     public const string PetExe    = "WorkBuddy PointPal.exe";
     public const string UninstExe = "Uninstall.exe";

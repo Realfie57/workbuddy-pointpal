@@ -627,6 +627,36 @@ sealed class SettingsDialog : Form {
     public Action<bool>   SetRememberScreen;
     public Action         AskToken;          // opens the credential dialog
 
+    // ---- credential page wiring (1.2.19.5) --------------------------------
+    // Probe returns 0 = accepted, 1 = rejected (401 / nothing stored),
+    // 2 = could not tell. It runs on a worker thread and must be safe to call
+    // repeatedly; the pet owns it because the credential lives there.
+    public Func<int>     CredentialProbe;
+    // Re-reads the "set / not set" block text after a credential was pasted,
+    // so the page cannot keep claiming "not set" right after the user set one.
+    public Func<string>  CredBlockSource;
+
+    readonly Label  _credBody   = new Label();
+    readonly Label  _credStatus = new Label();
+    readonly Button _credSet    = new Button();
+    readonly Button _credTest   = new Button();
+    System.Windows.Forms.Timer _credTimer;      // re-tests while the tab is open
+    int  _credBusy;                             // one probe in flight at a time
+    volatile bool _credClosed;                  // window gone: stop everything
+    int  _credState;                            // one of the Cred* constants
+
+    // States of the credential line. 0 is "no verdict yet" (nothing printed).
+    internal const int CredNone = 0, CredTesting = 1, CredOk = 2, CredBad = 3, CredNet = 4;
+    // How often the open credential page re-tests. Matches the widget's own
+    // poll cadence, so the page and the tablet never disagree for long.
+    const int CRED_POLL_MS = 5000;
+    // The "testing..." line must stay readable even when the gateway answers in
+    // 30 ms - otherwise the user cannot tell whether anything was tested at all.
+    const int CRED_MIN_TEST_MS = 500;
+    // Height of the status line, in unscaled units. One line is enough at the
+    // dialog's width; AutoSize stays off so the reserved space is fixed.
+    const int CredStatusH = 22;
+
     // Values as they were when the dialog opened - what 取消 restores.
     readonly double _cm0, _step0, _floatMult0;
     readonly string _label0, _char0;
@@ -800,8 +830,117 @@ sealed class SettingsDialog : Form {
         _startRemember.CheckedChanged += delegate { if (_startRemember.Checked) _remember = true;  };
         _startPrimary.CheckedChanged  += delegate { if (_startPrimary.Checked)  _remember = false; };
 
+        // The credential page tests itself the moment it becomes visible and
+        // keeps doing so until the window closes (asked 2026-10-18). Both
+        // directions matter: leaving the tab stops the probing, coming back
+        // starts it again - only closing the window is final.
+        tabs.SelectedIndexChanged += delegate { SyncCredPolling(); };
+        FormClosed += delegate { StopCredTimerFinal(); };
+
         AcceptButton = ok;
         CancelButton = cancel;
+    }
+
+    // ---- credential page behaviour ----------------------------------------
+
+    // The tab is fixed at index 2 (display / charging / credential).
+    internal const int CredTabIndex = 2;
+
+    void SyncCredPolling() {
+        if (_tabs == null) return;
+        if (_tabs.SelectedIndex == CredTabIndex) StartCredPolling();
+        else StopCredTimer();
+    }
+
+    void StartCredPolling() {
+        if (_credClosed) return;
+        if (_credTimer == null) {
+            _credTimer = new System.Windows.Forms.Timer();
+            _credTimer.Interval = CRED_POLL_MS;
+            _credTimer.Tick += delegate { TestCredentialNow(); };
+        }
+        if (!_credTimer.Enabled) _credTimer.Start();
+        TestCredentialNow();
+    }
+
+    // Stops the timer but keeps it alive: switching tabs away and back must
+    // resume the checks.
+    void StopCredTimer() {
+        if (_credTimer != null) _credTimer.Stop();
+    }
+
+    // Called once the window is gone - nothing may touch the controls after it.
+    void StopCredTimerFinal() {
+        _credClosed = true;
+        if (_credTimer != null) { _credTimer.Stop(); _credTimer.Dispose(); _credTimer = null; }
+    }
+
+    // Runs one probe on the thread pool. The label is only repainted for the
+    // FIRST probe (so it reads "testing...") - later re-tests update the label
+    // only when the verdict changes, otherwise the line would blink between
+    // "valid!" and "testing..." every five seconds.
+    internal void TestCredentialNow() { TestCredentialCore(false); }
+
+    // Explicit user action (the button, or just after pasting a credential):
+    // always show the "testing..." line, even when the previous verdict is
+    // still on screen - the user asked for this and expects to see something.
+    internal void TestCredentialUserRequested() { TestCredentialCore(true); }
+
+    void TestCredentialCore(bool announce) {
+        if (_credClosed) return;
+        if (CredentialProbe == null) return;
+        if (Interlocked.CompareExchange(ref _credBusy, 1, 0) != 0) return;
+        bool showTesting = announce || _credState == CredNone;
+        if (showTesting) SetCredState(CredTesting);
+        ThreadPool.QueueUserWorkItem(delegate {
+            int started = Environment.TickCount;
+            int r = 2;
+            try { r = CredentialProbe(); } catch { r = 2; }
+            // Floor the visible duration of the "testing..." line. Only when we
+            // actually put it up - a silent background re-test has nothing to
+            // read. Sleeping here, on a worker, keeps the UI thread free.
+            if (showTesting) {
+                int left = CRED_MIN_TEST_MS - (Environment.TickCount - started);
+                if (left > 0) System.Threading.Thread.Sleep(left);
+            }
+            int state = r == 0 ? CredOk : (r == 1 ? CredBad : CredNet);
+            try {
+                if (!_credClosed && !IsDisposed && IsHandleCreated) {
+                    BeginInvoke((MethodInvoker)delegate {
+                        Interlocked.Exchange(ref _credBusy, 0);
+                        if (_credClosed || IsDisposed) return;
+                        SetCredState(state);
+                    });
+                    return;
+                }
+            } catch { }
+            Interlocked.Exchange(ref _credBusy, 0);
+        });
+    }
+
+    void SetCredState(int s) {
+        _credState = s;
+        _credStatus.Text = CredStatusText(s);
+        _credStatus.ForeColor = s == CredOk ? Color.FromArgb(0, 122, 61)
+                              : s == CredBad ? Color.FromArgb(190, 40, 40)
+                              : SystemColors.GrayText;
+        _credStatus.Refresh();
+    }
+
+    // Single source of truth for what the line says - --parsetest asserts that
+    // every verdict maps to a distinct, non-empty string.
+    internal static string CredStatusText(int s) {
+        if (s == CredOk)      return WbPet.CredTextOk;
+        if (s == CredBad)     return WbPet.CredTextBad;
+        if (s == CredNet)     return WbPet.CredTextNet;
+        if (s == CredTesting) return WbPet.CredTextTesting;
+        return "";
+    }
+
+    internal string CredStatusForTest { get { return _credStatus.Text; } }
+    internal int    CredStateForTest  { get { return _credState; } }
+    internal bool   CredPollingForTest {
+        get { return _credTimer != null && _credTimer.Enabled; }
     }
 
     void CommitLabelEdit() {
@@ -996,34 +1135,68 @@ sealed class SettingsDialog : Form {
     TabPage BuildCredTab(string blockText) {
         TabPage p = new TabPage(WbPet.SettingsTabCredential);
 
-        Label body = new Label();
-        body.Text = blockText;
-        body.Font = new Font("Microsoft YaHei", 9.75F);
-        body.AutoSize = false;                 // Bounds height is authoritative
-        // MeasureText works in PHYSICAL pixels, so the measured height is NOT
-        // passed through Ps() a second time.
-        Size need = TextRenderer.MeasureText(
-            blockText, body.Font, new Size(InputDialog.Ps(LabW + TabCtlW), int.MaxValue),
-            TextFormatFlags.WordBreak);
-        int textH = need.Height + InputDialog.Ps(6);   // measured, not guessed
-        body.Bounds = new Rectangle(InputDialog.Ps(TabPad), InputDialog.Ps(TabPad),
-                                    InputDialog.Ps(LabW + TabCtlW), textH);
-        p.Controls.Add(body);
+        _credBody.Font = new Font("Microsoft YaHei", 9.75F);
+        _credBody.AutoSize = false;            // Bounds height is authoritative
+        p.Controls.Add(_credBody);
 
-        Button set = new Button();
-        set.Text = WbPet.SettingsSetToken;
-        set.Font = new Font("Microsoft YaHei", 9.75F);
-        set.Bounds = new Rectangle(InputDialog.Ps(TabPad),
-                                   InputDialog.Ps(TabPad) + textH + InputDialog.Ps(10),
-                                   InputDialog.Ps(140), InputDialog.Ps(30));
-        set.Click += delegate {
+        _credSet.Text = WbPet.SettingsSetToken;
+        _credSet.Font = new Font("Microsoft YaHei", 9.75F);
+        _credSet.Click += delegate {
             // The credential dialog is its own modal window. Apply first so the
             // user does not lose pending edits when they go paste a token.
             ApplyPending();
             if (AskToken != null) AskToken();
+            // The block text is built when the dialog opens, so it would still
+            // read "not set" right after a successful paste. Re-pull it, then
+            // prove the new credential straight away (asked 2026-10-18).
+            if (CredBlockSource != null) SetCredBlock(CredBlockSource());
+            TestCredentialUserRequested();
         };
-        p.Controls.Add(set);
+        p.Controls.Add(_credSet);
+
+        _credTest.Text = WbPet.SettingsTestToken;
+        _credTest.Font = new Font("Microsoft YaHei", 9.75F);
+        _credTest.Click += delegate { TestCredentialUserRequested(); };
+        p.Controls.Add(_credTest);
+
+        _credStatus.AutoSize = false;
+        _credStatus.Font = SmallFont();
+        _credStatus.TextAlign = ContentAlignment.MiddleLeft;
+        _credStatus.ForeColor = SystemColors.GrayText;
+        p.Controls.Add(_credStatus);
+
+        SetCredBlock(blockText);
+
+        // Opening the window with the credential tab already selected is not a
+        // path the code takes today (it starts on Display), but polling must not
+        // depend on that accident.
+        if (_tabs != null && _tabs.SelectedIndex == CredTabIndex) StartCredPolling();
         return p;
+    }
+
+    // Lays the page out for the given block text and pushes the rows below it
+    // down accordingly. TextRenderer measures in PHYSICAL pixels, so the
+    // measured height is not passed through Ps() a second time (see the DPI
+    // note on the layout helpers).
+    void SetCredBlock(string text) {
+        if (text == null) text = "";
+        _credBody.Text = text;
+        Size need = TextRenderer.MeasureText(
+            text, _credBody.Font, new Size(InputDialog.Ps(LabW + TabCtlW), int.MaxValue),
+            TextFormatFlags.WordBreak);
+        int textH = need.Height + InputDialog.Ps(6);
+        _credBody.Bounds = new Rectangle(InputDialog.Ps(TabPad), InputDialog.Ps(TabPad),
+                                         InputDialog.Ps(LabW + TabCtlW), textH);
+
+        int yBtn = InputDialog.Ps(TabPad) + textH + InputDialog.Ps(10);
+        _credSet.Bounds  = new Rectangle(InputDialog.Ps(TabPad), yBtn,
+                                         InputDialog.Ps(140), InputDialog.Ps(30));
+        _credTest.Bounds = new Rectangle(InputDialog.Ps(TabPad) + InputDialog.Ps(148), yBtn,
+                                         InputDialog.Ps(130), InputDialog.Ps(30));
+
+        int ySt = yBtn + InputDialog.Ps(30) + InputDialog.Ps(8);
+        _credStatus.Bounds = new Rectangle(InputDialog.Ps(TabPad), ySt,
+                                           InputDialog.Ps(LabW + TabCtlW), InputDialog.Ps(CredStatusH));
     }
 
     // Index of the preset equal to v, else the closest one.
@@ -1541,6 +1714,19 @@ public sealed class WbPet : Form {
     const string S_BTN_CANCEL= "\u53D6\u6D88";                                   // Cancel
     const string S_BTN_APPLY = "\u5E94\u7528";                                   // Apply
 
+    // ---- credential page: live validity check (1.2.19.5, asked 2026-10-18) --
+    // The page keeps testing the stored credential for as long as the settings
+    // window is open on that tab, so a dead session is visible BEFORE the
+    // balance collapses into "--". Four states: one transient, three steady.
+    const string S_CRED_TESTING = "\u6D4B\u8BD5\u51ED\u8BC1\u662F\u5426\u6709\u6548\u2026";   // testing whether the credential is valid...
+    const string S_CRED_OK      = "\u5B58\u50A8\u7684\u51ED\u8BC1\u6709\u6548\uFF01";         // the stored credential is valid!
+    const string S_CRED_BAD     = "\u5B58\u50A8\u7684\u51ED\u8BC1\u5DF2\u5931\u6548\uFF01\u8BF7\u91CD\u65B0\u7C98\u8D34\u51ED\u8BC1"; // ...has expired! paste a new one
+    // Only shown when the request could not be made at all (no HTTP answer -
+    // cable out, DNS dead, proxy hiccup). Reporting that as "expired" would
+    // send the user off to re-paste a credential that is perfectly fine.
+    const string S_CRED_NET     = "\u6D4B\u8BD5\u5931\u8D25\uFF1A\u7F51\u7EDC\u5F02\u5E38\uFF0C\u7A0D\u540E\u81EA\u52A8\u91CD\u8BD5"; // test failed: network, will retry
+    const string S_TESTCRED     = "\u6D4B\u8BD5\u5F53\u524D\u51ED\u8BC1";                      // test current credential
+
     // The settings dialog is a separate class, so the handful of strings it
     // needs are surfaced here rather than duplicated. Also lets --settest
     // print the exact labels the window will show.
@@ -1558,6 +1744,11 @@ public sealed class WbPet : Form {
     internal static string SettingsPosHint       { get { return S_POS_HINT; } }
     internal static string SettingsStartupHint   { get { return S_STARTUP_HINT; } }
     internal static string SettingsSetToken      { get { return S_SETTOKEN; } }
+    internal static string SettingsTestToken     { get { return S_TESTCRED; } }
+    internal static string CredTextTesting       { get { return S_CRED_TESTING; } }
+    internal static string CredTextOk            { get { return S_CRED_OK; } }
+    internal static string CredTextBad           { get { return S_CRED_BAD; } }
+    internal static string CredTextNet           { get { return S_CRED_NET; } }
     internal static string SettingsCustomHint    { get { return S_CUSTOM; } }     // "custom..."
     internal static string SettingsBtnOk         { get { return S_BTN_OK; } }
     internal static string SettingsBtnCancel     { get { return S_BTN_CANCEL; } }
@@ -1664,7 +1855,8 @@ public sealed class WbPet : Form {
         "--soundtest", "--soundprobe", "--soundsoak", "--soundab", "--simchain",
         "--abouttest", "--aboutsheet", "--toksheet", "--setsheet", "--updtest", "--updsheet",
         "--updnet", "--updfound", "--eggsound", "--eggsoundlive", "--aliascheck",
-        "--wbtest", "--cryptest", "--pickertest", "--rescuetest"
+        "--wbtest", "--cryptest", "--pickertest", "--rescuetest", "--parsetest",
+        "--credprobe"
     };
     public static bool IsTestMode(string[] args) {
         foreach (string a in args)
@@ -1871,6 +2063,16 @@ public sealed class WbPet : Form {
     volatile bool _noNetwork;        // set by the offline self-tests
     int _pollInFlight;               // only one balance request at a time
     double _bankedBal; bool _bankedSnap; bool _bankedValid;
+    int _pollSeq;                    // poll counter, drives the periodic cross-check
+    int _pollSkip;                   // poll ticks to sit out (401 backoff)
+    bool _credAlertShown;            // "credential rejected" balloon, once per run
+    // Cross-check the PaaS ledger on every user-initiated refresh plus once
+    // every LedgerCheckEvery polls (~5 min at the default 5 s cadence). The
+    // ledger is 82 KB, so it is not something to hit every single poll.
+    const int LedgerCheckEvery = 60;
+    // A rejected credential does not fix itself in five seconds; backing off
+    // keeps the widget from hammering the gateway until the user re-pastes.
+    const int CredBackoffTicks = 6;
 
     public WbPet(string baseDir, string[] args) {
         _baseDir = baseDir;
@@ -1967,7 +2169,13 @@ public sealed class WbPet : Form {
 
         _poll = new System.Windows.Forms.Timer();
         _poll.Interval = _pollMs < 1000 ? 1000 : _pollMs;
-        _poll.Tick += delegate { if (!_noNetwork) _pollWant = 1; };
+        _poll.Tick += delegate {
+            if (_noNetwork) return;
+            // Backoff after a rejected credential: sit out a few ticks instead
+            // of firing a request that is guaranteed to 401.
+            if (_pollSkip > 0) { _pollSkip--; return; }
+            _pollWant = 1;
+        };
         _poll.Start();
 
         PushLayer();
@@ -2075,7 +2283,9 @@ public sealed class WbPet : Form {
         _menu = new ContextMenuStrip();
 
         ToolStripMenuItem refresh = new ToolStripMenuItem(S_REFRESH);
-        refresh.Click += delegate { _pollWant = 2; };
+        // A deliberate refresh must cut through the 401 backoff - otherwise the
+        // user pastes a fresh credential and then waits 30 s for nothing.
+        refresh.Click += delegate { _pollSkip = 0; _pollWant = 2; };
         _menu.Items.Add(refresh);
 
         ToolStripMenuItem test = new ToolStripMenuItem(S_TEST);
@@ -2148,7 +2358,7 @@ public sealed class WbPet : Form {
         try {
             if (_tray != null) {
                 _tray.BalloonTipTitle = "WorkBuddy PointPal";
-                _tray.BalloonTipText = "桌宠已经在运行了，无需重复启动。";
+                _tray.BalloonTipText = "\u684C\u5BA0\u5DF2\u7ECF\u5728\u8FD0\u884C\u4E86\uFF0C\u65E0\u9700\u91CD\u590D\u542F\u52A8\u3002";
                 _tray.BalloonTipIcon = ToolTipIcon.Info;
                 _tray.ShowBalloonTip(3000);
             }
@@ -2223,7 +2433,27 @@ public sealed class WbPet : Form {
             d.SetSound = delegate (bool on) { if (on != _soundWanted) ToggleSound(); };
             d.SetRememberScreen = SetRememberScreen;
             d.AskToken = AskToken;
+            // The credential page owns the polling, the pet owns the probe: one
+            // request path, the same headers, the same idea of "accepted".
+            d.CredentialProbe = new Func<int>(ProbeCredential);
+            d.CredBlockSource = new Func<string>(SettingsCredBlock);
             d.ShowDialog(this);
+        }
+    }
+
+    // One cheap request whose only job is to answer "is the stored credential
+    // still accepted?". Returns 0 = yes, 1 = rejected (that includes "nothing
+    // stored"), 2 = the question could not be asked (transport failure).
+    // Deliberately does NOT touch _realBal / _bookedAt / the tray: a probe must
+    // never move the number, only report on the credential.
+    int ProbeCredential() {
+        if (string.IsNullOrEmpty(_token)) return 1;
+        if (_noNetwork) return 0;              // offline self-tests stay offline
+        try {
+            string body = FetchPost(_apiUrl, "{}");
+            return double.IsNaN(ParseCredits(body)) ? 2 : 0;
+        } catch (Exception ex) {
+            return ex.Message.IndexOf("401") >= 0 ? 1 : 2;
         }
     }
 
@@ -2234,7 +2464,8 @@ public sealed class WbPet : Form {
         return S_SETTOKEN + "\uFF1A" + (has ? "\u5DF2\u8BBE\u7F6E" : "\u672A\u8BBE\u7F6E") + "\r\n\r\n" +
                "\u51ED\u8BC1\u4FDD\u5B58\u5728\u672C\u673A\u6570\u636E\u76EE\u5F55\uFF0C" +
                "\u7ECF DPAPI \u672C\u7528\u6237\u52A0\u5BC6\uFF0C\u53EF\u5728\u4E0B\u65B9\u91CD\u65B0\u8BBE\u7F6E\u3002\r\n" +
-               "\u8FC7\u671F\u540E\u5E94\u7528\u4F1A\u7EA2\u70B9\u63D0\u9192\uFF0C\u5230\u65F6\u91CD\u65B0\u7C98\u8D34 cURL \u5373\u53EF\u3002";
+               "\u8FC7\u671F\u540E\u4F1A\u81EA\u52A8\u63D0\u9192\uFF0C\u4E5F\u53EF\u70B9\u4E0B\u65B9\u300C"
+             + "\u6D4B\u8BD5\u5F53\u524D\u51ED\u8BC1\u300D\u968F\u65F6\u68C0\u67E5\u3002";
     }
 
     // This used to be a plain MessageBox. It is now a small dialog because the
@@ -2589,13 +2820,21 @@ public sealed class WbPet : Form {
         return sb.ToString();
     }
 
-    // "1.2.9" out of "1.2.9.0"; "?" if the metadata is somehow missing.
-    // The 4th segment is the build marker and is deliberately NOT shown
-    // here - see AboutVersionLabel, which is what users read.
+    // "1.2.9" out of "1.2.9.0"; "1.2.19.5" out of "1.2.19.5".
+    // The 4th segment used to be a build marker that was never shown, so a
+    // patch release could not be told apart from the mainline one. Since
+    // 1.2.19.5 it IS shown - but only when it is non-zero, which keeps every
+    // earlier number printing exactly as it used to (".0" stays invisible).
+    // The update check reads this same string, and CompareVersions is
+    // length-tolerant, so a 4-part tag compares correctly against it.
     static string AboutVersion() {
         try {
             Version v = Assembly.GetExecutingAssembly().GetName().Version;
-            if (v != null) return v.Major + "." + v.Minor + "." + v.Build;
+            if (v != null) {
+                string s = v.Major + "." + v.Minor + "." + v.Build;
+                if (v.Revision > 0) s += "." + v.Revision;
+                return s;
+            }
         } catch { }
         return "?";
     }
@@ -2772,21 +3011,43 @@ public sealed class WbPet : Form {
                        _soundWanted, _rememberScreen, Chars, SettingsCredBlock())) {
                 d.StartPosition = FormStartPosition.Manual;
                 d.Location = new Point(-10000, -10000);
+                // A deterministic verdict, so the credential tab's status line
+                // is really painted in the capture instead of the screenshot
+                // showing an empty strip that could be hiding a clipped label.
+                d.CredentialProbe = delegate { return 0; };
                 d.Show();
                 d.SelectTabForTest(tab);
                 // Pump until the controls have been placed and painted; a single
                 // DoEvents() captures the window mid-layout (blank form, children
                 // still at 0,0). Bounded so a headless session cannot spin.
                 DateTime deadline = DateTime.UtcNow.AddSeconds(2);
+                bool waitVerdict = (tab == SettingsDialog.CredTabIndex);
+                Stopwatch wait = Stopwatch.StartNew();
                 while (DateTime.UtcNow < deadline) {
                     Application.DoEvents();
                     System.Threading.Thread.Sleep(30);
-                    break;   // one settle pass is enough for a static dialog
+                    // The credential page answers from a worker thread; give it
+                    // a moment to land so the sheet shows a real verdict.
+                    if (waitVerdict) {
+                        // CredOk/CredBad/CredNet are the settled states;
+                        // CredTesting must not end the wait.
+                        if (d.CredStateForTest >= SettingsDialog.CredOk) break;
+                    } else {
+                        break;   // one settle pass is enough for a static dialog
+                    }
                 }
+                // Evidence for the "testing..." floor: with an instant stub
+                // answer this can only settle early if the 500 ms hold is gone.
+                if (waitVerdict)
+                    Console.WriteLine("credwait[" + tab + "]: " + wait.ElapsedMilliseconds + " ms");
                 Console.WriteLine("setlayout[" + tab + "]: client=" +
                                   d.ClientSize.Width + "x" + d.ClientSize.Height +
                                   " tab=" + d.TabTitleForTest());
                 Console.WriteLine("setfit[" + tab + "]: " + d.LayoutReport());
+                // The credential tab carries a status line and a second button;
+                // print what it holds so the screenshot can be tied to a state.
+                Console.WriteLine("credstatus[" + tab + "]: '" + d.CredStatusForTest +
+                                  "' polling=" + d.CredPollingForTest);
                 using (Bitmap b = new Bitmap(d.Width, d.Height)) {
                     d.DrawToBitmap(b, new Rectangle(0, 0, d.Width, d.Height));
                     b.Save(Path.Combine(dir, names[tab]), ImageFormat.Png);
@@ -2888,6 +3149,124 @@ public sealed class WbPet : Form {
               IsOnSomeScreenPublic);
 
         Console.WriteLine("\nrescuetest: " + pass + " passed, " + fail + " failed");
+    }
+
+    // --parsetest: the 2026-10-17 doubling bug in one place.
+    //
+    // The gateway now answers the SAME account with two different bodies - a
+    // lean one (Packages only) and a rich one (Packages + TotalCredits +
+    // CreditGroups, where CreditGroups repeats the same breakdown). The old
+    // parser scanned from "Packages" to the end of the body and therefore
+    // counted the rich form twice, so the widget printed exactly 2x and then
+    // booked an endless charge animation. These fixtures are the real bodies,
+    // truncated only in the requestId.
+    //
+    // Deliberately ASCII-only inside the JSON (the package NAME is dropped):
+    // the fixture is about numbers, and this file is compiled under the ANSI
+    // codepage, so a literal Chinese value would arrive here as mojibake.
+    const string FIX_LEAN =
+        "{\"code\":0,\"msg\":\"OK\",\"requestId\":\"lean\",\"data\":{\"Packages\":[" +
+        "{\"PackageCode\":\"TCACA_code_007_nzdH5h4Nl0\",\"CycleTotalCapacity\":\"4768\"," +
+        "\"CycleRemainCapacity\":\"3474.10000165\",\"CycleUsedCapacity\":\"1293.89999835\"," +
+        "\"CycleFrozenCapacity\":\"0\",\"CapacityUnit\":\"credits\",\"TotalCount\":54}," +
+        "{\"PackageCode\":\"TCACA_code_008_cfWoLwvjU4\",\"CycleTotalCapacity\":\"500\"," +
+        "\"CycleRemainCapacity\":\"500\",\"CycleUsedCapacity\":\"0\"," +
+        "\"CycleFrozenCapacity\":\"0\",\"CapacityUnit\":\"credits\",\"TotalCount\":1}]," +
+        "\"SubscriptionPackageCode\":\"\",\"SubscriptionPackageName\":\"x\"," +
+        "\"IsPaidUser\":false,\"IsProtectedPriceUser\":false}}";
+
+    const string FIX_RICH =
+        "{\"code\":0,\"msg\":\"OK\",\"requestId\":\"rich\",\"data\":{\"Packages\":[" +
+        "{\"PackageCode\":\"TCACA_code_007_nzdH5h4Nl0\",\"CycleTotalCapacity\":\"4768\"," +
+        "\"CycleRemainCapacity\":\"3474.10000165\",\"CycleUsedCapacity\":\"1293.89999835\"," +
+        "\"CycleFrozenCapacity\":\"0\",\"CapacityUnit\":\"credits\",\"TotalCount\":54}," +
+        "{\"PackageCode\":\"TCACA_code_008_cfWoLwvjU4\",\"CycleTotalCapacity\":\"500\"," +
+        "\"CycleRemainCapacity\":\"500\",\"CycleUsedCapacity\":\"0\"," +
+        "\"CycleFrozenCapacity\":\"0\",\"CapacityUnit\":\"credits\",\"TotalCount\":1}]," +
+        "\"TotalCredits\":\"3974.10000165\",\"SubscriptionPackageCode\":\"\"," +
+        "\"SubscriptionPackageName\":\"x\",\"IsPaidUser\":false,\"IsProtectedPriceUser\":false," +
+        "\"CreditGroups\":[" +
+        "{\"Kind\":\"plan_base\",\"Name\":\"b\",\"CycleTotalCapacity\":\"500\"," +
+        "\"CycleRemainCapacity\":\"500\",\"CycleUsedCapacity\":\"0\",\"CycleFrozenCapacity\":\"0\"," +
+        "\"CapacityUnit\":\"credits\",\"TotalCount\":1}," +
+        "{\"Kind\":\"addon\",\"Name\":\"a\",\"CycleTotalCapacity\":\"0\",\"CycleRemainCapacity\":\"0\"," +
+        "\"CycleUsedCapacity\":\"0\",\"CycleFrozenCapacity\":\"0\",\"CapacityUnit\":\"credits\",\"TotalCount\":0}," +
+        "{\"Kind\":\"benefit\",\"Name\":\"c\",\"CycleTotalCapacity\":\"4768\"," +
+        "\"CycleRemainCapacity\":\"3474.10000165\",\"CycleUsedCapacity\":\"1293.89999835\"," +
+        "\"CycleFrozenCapacity\":\"0\",\"CapacityUnit\":\"credits\",\"TotalCount\":54}]}}";
+
+    public void RunParseTest() {
+        Console.WriteLine("balance parsing regression (--parsetest)");
+        int pass = 0, fail = 0;
+        Action<string, bool> check = delegate (string name, bool ok) {
+            Console.WriteLine("  " + (ok ? "PASS  " : "FAIL  ") + name);
+            if (ok) pass++; else fail++;
+        };
+        const double WANT = 3974.10000165;
+
+        double lean = ParseCredits(FIX_LEAN);
+        double rich = ParseCredits(FIX_RICH);
+        Console.WriteLine("  lean=" + lean.ToString("0.####", CultureInfo.InvariantCulture) +
+                          " rich=" + rich.ToString("0.####", CultureInfo.InvariantCulture));
+
+        check("lean body parses to the real total", Math.Abs(lean - WANT) < 1e-6);
+        check("rich body parses to the SAME total", Math.Abs(rich - WANT) < 1e-6);
+        // The whole point: the duplicated group must not add a second copy.
+        check("rich body is not double counted", Math.Abs(rich - WANT * 2) > 1);
+        check("CreditGroups alone never contributes",
+              Math.Abs(rich - lean) < 1e-6);
+
+        // Cycle total (tray tooltip) obeys the same scoping.
+        check("lean cycleTotal = 4768 + 500",
+              Math.Abs(ParseCreditsTotal(FIX_LEAN) - 5268.0) < 1e-6);
+        check("rich cycleTotal ignores CreditGroups",
+              Math.Abs(ParseCreditsTotal(FIX_RICH) - 5268.0) < 1e-6);
+
+        // The server's own total is read as a cross-check, not as the value.
+        check("TotalCredits field is readable", Math.Abs(ParseTotalField(FIX_RICH) - WANT) < 1e-6);
+        check("TotalCredits absent on the lean body",
+              double.IsNaN(ParseTotalField(FIX_LEAN)));
+
+        // Fallback path: no Packages at all -> the printed total stands in.
+        check("Packages missing falls back to TotalCredits",
+              Math.Abs(ParseCredits("{\"data\":{\"TotalCredits\":\"123.45\"}}") - 123.45) < 1e-6);
+        // ...but a body with neither must FAIL rather than invent a number.
+        check("no Packages and no TotalCredits -> NaN",
+              double.IsNaN(ParseCredits("{\"data\":{}}")));
+        check("garbage -> NaN", double.IsNaN(ParseCredits("not json at all")));
+        check("empty -> NaN", double.IsNaN(ParseCredits("")));
+
+        // A bracket inside a string value must not end the scope early.
+        string tricky =
+            "{\"data\":{\"Packages\":[{\"Note\":\"]}\",\"CycleRemainCapacity\":\"10\"}]," +
+            "\"CreditGroups\":[{\"CycleRemainCapacity\":\"10\"}]}}";
+        check("a ']' inside a string does not end the array",
+              Math.Abs(ParseCredits(tricky) - 10.0) < 1e-6);
+
+        // Ledger shape (free/paid packages): one row per resource cycle.
+        string ledger =
+            "{\"data\":{\"Accounts\":[" +
+            "{\"CycleCapacityRemainPrecise\":\"3473.27\",\"CapacityRemainPrecise\":\"0\"}," +
+            "{\"CycleCapacityRemainPrecise\":\"500\",\"CapacityRemainPrecise\":\"0\"}]," +
+            "\"TotalCount\":2}}";
+        string scope = ArrayAfter(ledger, "\"Accounts\"");
+        double led = scope == null ? double.NaN : SumMatches(RxAcctRemain, scope);
+        check("ledger sums CycleCapacityRemainPrecise only",
+              !double.IsNaN(led) && Math.Abs(led - 3973.27) < 1e-6);
+
+        // The verdict texts of the credential page must stay distinct - the
+        // label is the only feedback the user gets.
+        string txtTesting = SettingsDialog.CredStatusText(SettingsDialog.CredTesting);
+        string txtOk      = SettingsDialog.CredStatusText(SettingsDialog.CredOk);
+        string txtBad     = SettingsDialog.CredStatusText(SettingsDialog.CredBad);
+        check("credential verdict texts are all non-empty",
+              txtTesting.Length > 0 && txtOk.Length > 0 && txtBad.Length > 0);
+        check("credential verdict texts are distinct",
+              txtTesting != txtOk && txtTesting != txtBad && txtOk != txtBad);
+        check("no verdict prints nothing",
+              SettingsDialog.CredStatusText(SettingsDialog.CredNone).Length == 0);
+
+        Console.WriteLine("\nparsetest: " + pass + " passed, " + fail + " failed");
     }
 
     // --pickertest: the reopen bug in one place. Each NumPicker is handed a
@@ -3257,6 +3636,10 @@ public sealed class WbPet : Form {
         if (!AskCredential(_token, out k)) return;
         if (k.Length > 0 && k != _token) {
             SetToken(k);
+            // A brand-new credential ends any backoff and re-arms the one-shot
+            // "rejected" balloon, so the very next poll gets a fair chance.
+            _pollSkip = 0;
+            _credAlertShown = false;
             _pollWant = 2;
             Log("token set manually (mode=" + (_credIsCookie ? "cookie" : "bearer") +
                 ", length " + _token.Length + ", uid=" +
@@ -4369,9 +4752,14 @@ public sealed class WbPet : Form {
         }
     }
 
-    string FetchWithHttp() {
-        HttpRequestMessage req = new HttpRequestMessage(HttpMethod.Post, _apiUrl);
-        req.Content = new StringContent("{}", Encoding.UTF8, "application/json");
+    string FetchWithHttp() { return FetchPost(_apiUrl, "{}"); }
+
+    // Same headers, arbitrary URL + body: the summary takes {}, the package
+    // ledgers take a filter. Keeping one code path means a header added for the
+    // gateway cannot be missing on the "other" request.
+    string FetchPost(string url, string json) {
+        HttpRequestMessage req = new HttpRequestMessage(HttpMethod.Post, url);
+        req.Content = new StringContent(json, Encoding.UTF8, "application/json");
         if (_credIsCookie) req.Headers.TryAddWithoutValidation("Cookie", _token);
         else req.Headers.TryAddWithoutValidation("Authorization", "Bearer " + _token);
         if (_ua.Length > 0) req.Headers.TryAddWithoutValidation("User-Agent", _ua);
@@ -4524,12 +4912,39 @@ public sealed class WbPet : Form {
         }
         if (Interlocked.CompareExchange(ref _pollInFlight, 1, 0) != 0) return;
         bool wantSnap = snap;
+        int seq = Interlocked.Increment(ref _pollSeq);
+        bool wantCheck = wantSnap || (seq % LedgerCheckEvery == 0);
         ThreadPool.QueueUserWorkItem(delegate {
             try {
                 string body = FetchBalance();
                 double bal = ParseCredits(body);
                 if (double.IsNaN(bal)) { Fail("cannot parse response: " + Trunc(body)); return; }
                 double tot = ParseCreditsTotal(body);
+
+                // The gateway prints its own total next to the packages, which
+                // gives a free consistency check on the scoped parse: if the
+                // two ever drift apart the envelope changed shape again, and
+                // the log says so before the number looks wrong on screen.
+                double selfTotal = ParseTotalField(body);
+                if (!double.IsNaN(selfTotal) && Math.Abs(selfTotal - bal) > 0.5)
+                    Log("TotalCredits mismatch: total=" + FmtAmt(selfTotal) +
+                        " PackagesSum=" + FmtAmt(bal) + " (using PackagesSum)");
+
+                // Second opinion from the raw ledger (see FetchDetailCredits).
+                if (wantCheck && !_noNetwork) {
+                    double ledger = FetchDetailCredits();
+                    if (!double.IsNaN(ledger)) {
+                        if (CreditsDisagree(bal, ledger)) {
+                            Log("ledger disagrees: summary=" + FmtAmt(bal) +
+                                " ledger=" + FmtAmt(ledger) + " -> using ledger");
+                            bal = ledger;
+                            if (double.IsNaN(tot)) tot = ledger;
+                        } else {
+                            Log("ledger agrees: " + FmtAmt(ledger));
+                        }
+                    }
+                }
+
                 lock (_hits) {
                     _bankedBal = bal; _bankedSnap = wantSnap; _bankedValid = true;
                     if (!double.IsNaN(tot)) _totalBal = tot;
@@ -4585,6 +5000,10 @@ public sealed class WbPet : Form {
         lock (_hits) {
             _connected = true;
             _lastPollResult = "";
+            // A good reading ends the backoff and re-arms the one-shot balloon,
+            // so a credential that dies again later warns again.
+            _pollSkip = 0;
+            _credAlertShown = false;
             bool firstReading = double.IsNaN(_realBal);
             _realBal = bal;
             if (firstReading) {
@@ -4637,25 +5056,88 @@ public sealed class WbPet : Form {
         Log("poll FAILED: " + why + (expired
             ? " (credential rejected: expired, or cookie pasted without its bound User-Agent - paste the full cURL via the menu)"
             : ""));
+        if (expired) {
+            // 1.2.19.5: the tray used to say nothing at all, so a dead session
+            // looked exactly like "the numbers stopped moving". One balloon per
+            // failure streak, then back off instead of hammering the gateway.
+            _pollSkip = CredBackoffTicks;
+            if (!_credAlertShown) {
+                _credAlertShown = true;
+                NotifyCredentialRejected();
+            }
+        }
         _dirty = true;
     }
 
-    // balance = sum of data.Packages[].CycleRemainCapacity. Scanned with a
-    // case-insensitive regex so the parser survives both casing styles and
-    // wrapper changes (code/msg/data envelope etc.); numbers may be quoted.
+    void NotifyCredentialRejected() {
+        try {
+            if (_tray == null) return;
+            _tray.BalloonTipTitle = "WorkBuddy PointPal";
+            _tray.BalloonTipText = S_EXPIRED + "\uFF0C\u8BF7\u53F3\u952E\u6253\u5F00\u300C" +
+                                   S_SETTINGS + "\u300D\u91CD\u65B0\u7C98\u8D34\u51ED\u8BC1\u3002";
+            _tray.BalloonTipIcon = ToolTipIcon.Warning;
+            _tray.ShowBalloonTip(6000);
+        } catch { }
+    }
+
+    // balance = sum of data.Packages[].CycleRemainCapacity.
+    //
+    // 1.2.19.5: the scan is SCOPED TO THE "Packages" ARRAY. On 2026-10-17 the
+    // gateway began returning the same breakdown a second time in
+    // CreditGroups[] (plus a TotalCredits total). The old code scanned from
+    // "Packages" to the END OF THE BODY, so when the rich body arrived the same
+    // credits were counted twice and the widget printed exactly 2x - which then
+    // booked an endless charge animation. The desktop client's own parser
+    // (parseResourceSummary in app.asar) likewise reads Packages ONLY.
     static readonly Regex RxRemain =
         new Regex("cycleRemain(?:Capacity)?\"?\\s*:\\s*\"?(-?[0-9]+(?:\\.[0-9]+)?)",
                   RegexOptions.Compiled | RegexOptions.IgnoreCase);
     static readonly Regex RxTotal =
         new Regex("cycleTotal(?:Capacity)?\"?\\s*:\\s*\"?(-?[0-9]+(?:\\.[0-9]+)?)",
                   RegexOptions.Compiled | RegexOptions.IgnoreCase);
+    // The server's own total. Used for the sanity check and as a last-resort
+    // fallback - never as the primary value (the client does not use it either).
+    static readonly Regex RxTotalField =
+        new Regex("\"TotalCredits\"\\s*:\\s*\"?(-?[0-9]+(?:\\.[0-9]+)?)",
+                  RegexOptions.Compiled | RegexOptions.IgnoreCase);
+    // One row of the PaaS ledger (free/paid package accounts).
+    static readonly Regex RxAcctRemain =
+        new Regex("\"CycleCapacityRemainPrecise\"\\s*:\\s*\"?(-?[0-9]+(?:\\.[0-9]+)?)",
+                  RegexOptions.Compiled | RegexOptions.IgnoreCase);
+
+    // The literal text of the JSON array that follows `key` (quoted, exact
+    // case), brackets balanced and strings skipped. Returns null when absent.
+    // Scoping by brackets - rather than by "everything after" - is what makes
+    // a duplicated group elsewhere in the envelope harmless.
+    static string ArrayAfter(string json, string key) {
+        if (json == null) return null;
+        int k = json.IndexOf(key, StringComparison.OrdinalIgnoreCase);
+        if (k < 0) return null;
+        int open = json.IndexOf('[', k + key.Length);
+        if (open < 0) return null;
+        bool inStr = false, esc = false;
+        int depth = 0;
+        for (int i = open; i < json.Length; i++) {
+            char c = json[i];
+            if (inStr) {
+                if (esc) esc = false;
+                else if (c == '\\') esc = true;
+                else if (c == '"') inStr = false;
+                continue;
+            }
+            if (c == '"') { inStr = true; continue; }
+            if (c == '[') depth++;
+            else if (c == ']') {
+                depth--;
+                if (depth == 0) return json.Substring(open, i - open + 1);
+            }
+        }
+        return null;
+    }
 
     static double SumMatches(Regex rx, string json) {
-        string scope = json;
-        int p = json.IndexOf("\"Packages\"", StringComparison.OrdinalIgnoreCase);
-        if (p >= 0) scope = json.Substring(p);
         double sum = 0; int n = 0;
-        foreach (Match m in rx.Matches(scope)) {
+        foreach (Match m in rx.Matches(json)) {
             double v;
             if (double.TryParse(m.Groups[1].Value, NumberStyles.Float, CultureInfo.InvariantCulture, out v)) {
                 if (v > 0) { sum += v; n++; }
@@ -4664,8 +5146,124 @@ public sealed class WbPet : Form {
         return n > 0 ? sum : double.NaN;
     }
 
-    static double ParseCredits(string json) { return SumMatches(RxRemain, json); }
-    static double ParseCreditsTotal(string json) { return SumMatches(RxTotal, json); }
+    static double ParseCredits(string json) {
+        string scope = ArrayAfter(json, "\"Packages\"");
+        if (scope != null) {
+            double v = SumMatches(RxRemain, scope);
+            if (!double.IsNaN(v)) return v;
+        }
+        // No usable Packages array: take the server's own total if it printed
+        // one. Falling back to "scan the whole body" is what caused 2026-10-17
+        // and must never come back.
+        return ParseTotalField(json);
+    }
+
+    static double ParseTotalField(string json) {
+        if (json == null) return double.NaN;
+        Match m = RxTotalField.Match(json);
+        double v;
+        if (m.Success && double.TryParse(m.Groups[1].Value, NumberStyles.Float,
+                                         CultureInfo.InvariantCulture, out v)) return v;
+        return double.NaN;
+    }
+
+    static double ParseCreditsTotal(string json) {
+        string scope = ArrayAfter(json, "\"Packages\"");
+        return scope == null ? double.NaN : SumMatches(RxTotal, scope);
+    }
+
+    // ---- second opinion from the PaaS ledger (1.2.19.5) --------------------
+    //
+    // The summary endpoint is the fast path, but it is also the endpoint that
+    // changed shape under us. The two package endpoints return the raw ledger
+    // (one row per resource cycle, 55 rows on this account) and are immune to
+    // envelope changes up there. They are too heavy to poll (82 KB), so they
+    // are used as a CROSS-CHECK: whenever it disagrees by more than a hair, the
+    // ledger wins and the disagreement is logged.
+    //
+    // The codes are the client's own Q enum (renderer/assets/common-*.js);
+    // omitting them is a hard 10001 "PackageCodes required".
+    static readonly string[] FREE_PKG_CODES = new string[] {
+        "TCACA_code_001_PqouKr6QWV", "TCACA_code_008_cfWoLwvjU4",
+        "TCACA_code_035_ArVxJcGDsm", "TCACA_code_006_DbXS0lrypC",
+        "TCACA_code_039_KRcQj7wUat", "TCACA_code_040_mi9rCYg46x",
+        "TCACA_code_007_nzdH5h4Nl0", "TCACA_code_028_NtpWi0jzXs",
+        "TCACA_code_037_WxOD3MpI2o", "TCACA_code_029_6wCGEWquYy",
+        "TCACA_code_030_BjSt89qTvr"
+    };
+    static readonly string[] PAID_PKG_CODES = new string[] {
+        "TCACA_code_002_AkiJS3ZHF5", "TCACA_code_005_maRGyrHhw1",
+        "TCACA_code_003_FAnt7lcmRT", "TCACA_code_023_4xbGhMrE6q",
+        "TCACA_code_026_BaESVICNoi", "TCACA_code_027_0FCGVA6vSa",
+        "TCACA_code_009_0XmEQc2xOf", "TCACA_code_036_lupO5WgNdG",
+        "TCACA_code_038_OhvqZtiPKr"
+    };
+
+    // Same host as _apiUrl, sibling path. Returns null when _apiUrl has been
+    // pointed somewhere else (WBPET_API override / a fixture) - in that case we
+    // simply do not cross-check rather than firing at the real gateway.
+    string LedgerUrl(string leaf) {
+        int i = _apiUrl.LastIndexOf("/billing/meter/", StringComparison.OrdinalIgnoreCase);
+        if (i < 0) return null;
+        return _apiUrl.Substring(0, i) + "/billing/meter/" + leaf;
+    }
+
+    static string PkgBody(string[] codes, bool isFree) {
+        StringBuilder b = new StringBuilder();
+        b.Append("{\"PackageCodes\":[");
+        for (int i = 0; i < codes.Length; i++) {
+            if (i > 0) b.Append(',');
+            b.Append('"').Append(codes[i]).Append('"');
+        }
+        b.Append("],\"PageNumber\":1,\"PageSize\":200");
+        string day = DateTime.Now.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
+        if (isFree) {
+            b.Append(",\"SlicePeriodStartTime\":\"").Append(day).Append(" 00:00:00\"");
+            b.Append(",\"SlicePeriodEndTime\":\"").Append(day).Append(" 23:59:59\"");
+        } else {
+            b.Append(",\"NeedRenewInfo\":true");
+        }
+        b.Append('}');
+        return b.ToString();
+    }
+
+    // Sum of one ledger page; NaN when it could not be read (the caller treats
+    // NaN as "no second opinion available", never as zero).
+    double FetchLedgerSum(string url, string body, string tag) {
+        try {
+            string r = FetchPost(url, body);
+            string scope = ArrayAfter(r, "\"Accounts\"");
+            if (scope == null) { Log("ledger " + tag + ": no Accounts array"); return double.NaN; }
+            double v = SumMatches(RxAcctRemain, scope);
+            Log("ledger " + tag + ": " + (double.IsNaN(v) ? "empty" : FmtAmt(v)));
+            return v;
+        } catch (Exception ex) {
+            Log("ledger " + tag + " failed: " + ex.Message);
+            return double.NaN;
+        }
+    }
+
+    double FetchDetailCredits() {
+        string free = LedgerUrl("get-user-resource-free-packages");
+        string paid = LedgerUrl("get-user-resource-paid-packages");
+        if (free == null) return double.NaN;
+        double sum = 0; bool any = false;
+        double f = FetchLedgerSum(free, PkgBody(FREE_PKG_CODES, true), "free");
+        if (!double.IsNaN(f)) { sum += f; any = true; }
+        if (paid != null) {
+            double p = FetchLedgerSum(paid, PkgBody(PAID_PKG_CODES, false), "paid");
+            if (!double.IsNaN(p)) { sum += p; any = true; }
+        }
+        return any ? sum : double.NaN;
+    }
+
+    // A difference of a few credits is normal (the two endpoints are read
+    // milliseconds apart and every message burns credits); a difference of a
+    // percent is a shape change. 2% or 1 credit, whichever is larger.
+    static bool CreditsDisagree(double a, double b) {
+        double tol = Math.Max(1.0, Math.Abs(b) * 0.02);
+        return Math.Abs(a - b) > tol;
+    }
 
     void Log(string msg) {
         try {
@@ -4949,6 +5547,25 @@ public sealed class WbPet : Form {
             return;
         }
 
+        // --parsetest: the balance doubling of 2026-10-17. Pure string
+        // fixtures - the two bodies the gateway alternates between - plus the
+        // ledger shape and the credential-page verdict texts.
+        if (Array.IndexOf(args, "--parsetest") >= 0) {
+            pet.GoOffline();
+            pet.RunParseTest();
+            Application.Exit();
+            return;
+        }
+
+        // --credprobe: the settings window's credential check, once, against the
+        // live gateway. Deliberately does NOT go offline - the whole point is to
+        // see what the real endpoint answers.
+        if (Array.IndexOf(args, "--credprobe") >= 0) {
+            pet.RunCredentialProbeTest();
+            Application.Exit();
+            return;
+        }
+
         // --aboutsheet <png>: render the About dialog itself (it is a real form
         // now, not a MessageBox), so its layout is reviewable headlessly.
         int sheetIdx = Array.IndexOf(args, "--aboutsheet");
@@ -5210,6 +5827,22 @@ public sealed class WbPet : Form {
     public void PumpTicks(int n) { for (int i = 0; i < n; i++) OnTickProbe(); }
     // tests must never talk to the network: that races with the simulated readings
     public void PollNowSyncPublic(bool snap) { PollNowSync(snap); }
+
+    // --credprobe: run the credential check ONCE against the real gateway and
+    // print the verdict, i.e. exactly what the settings window's status line
+    // would show. Read-only: it never touches the balance or the credential
+    // file (test modes are _suppressSave).
+    public void RunCredentialProbeTest() {
+        Console.WriteLine("credential probe (--credprobe)");
+        Console.WriteLine("  token present : " + (!string.IsNullOrEmpty(_token)));
+        Console.WriteLine("  user-agent    : " + (_ua.Length > 0 ? _ua : "(empty)"));
+        int r = ProbeCredential();
+        Console.WriteLine("  verdict       : " + r + " (" +
+                          (r == 0 ? "accepted" : r == 1 ? "rejected" : "could not tell") + ")");
+        Console.WriteLine("  status line   : " + SettingsDialog.CredStatusText(
+                          r == 0 ? SettingsDialog.CredOk : (r == 1 ? SettingsDialog.CredBad : SettingsDialog.CredNet)));
+        Console.WriteLine("CRED PROBE: " + (r == 0 ? "OK" : "NOT-OK"));
+    }
     // Exposes the credential parser to --credtest. Kept as a thin wrapper so
     // the regression suite exercises the REAL SetToken, not a copy of it.
     public void SetTokenForTest(string raw) { SetToken(raw); }
